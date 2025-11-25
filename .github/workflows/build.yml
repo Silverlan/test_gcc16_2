@@ -51,7 +51,7 @@ jobs:
       - name: Install Dependencies
         shell: bash
         run: |
-          apt install ninja-build
+          sudo apt install ninja-build
 
       - name: Build Pragma
         uses: ./pragma/github_actions/build

@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# disk-console-report.sh
+# disk-console-report-fixed.sh
 # Prints a disk-usage report to console only (no files).
+# Avoids "Broken pipe" noise from sort/head.
 # Usage:
-#   ./disk-console-report.sh             # report only for /
-#   ./disk-console-report.sh --path / --top 30
-#   ./disk-console-report.sh --clean-caches --prune-docker --yes
+#   ./disk-console-report-fixed.sh
+#   ./disk-console-report-fixed.sh --path / --top 50 --depth 20
+#   ./disk-console-report-fixed.sh --clean-caches --prune-docker --yes
 #
 # Flags:
 #  --path PATH         path to inspect (default /)
 #  --top N             how many top items to show (default 25)
+#  --depth D           max-depth for du (default 20)
 #  --clean-caches      show candidate caches and optionally clean
 #  --prune-docker      show docker prune candidate and optionally prune
 #  --aggressive        include aggressive runner/toolcache deletions (dangerous)
@@ -19,6 +21,7 @@ set -euo pipefail
 
 PATH_TO_CHECK="/"
 TOP_N=25
+DEPTH=20
 CLEAN_CACHES=0
 PRUNE_DOCKER=0
 AGGRESSIVE=0
@@ -28,42 +31,51 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --path) PATH_TO_CHECK="$2"; shift 2;;
     --top) TOP_N="$2"; shift 2;;
+    --depth) DEPTH="$2"; shift 2;;
     --clean-caches) CLEAN_CACHES=1; shift;;
     --prune-docker) PRUNE_DOCKER=1; shift;;
     --aggressive) AGGRESSIVE=1; shift;;
     --yes) ASSUME_YES=1; shift;;
-    --help) awk 'NR>1{print} /# disk-console-report.sh/ {exit}' "$0" ; exit 0;;
+    --help) awk 'NR>1{print} /# disk-console-report-fixed.sh/ {exit}' "$0" ; exit 0;;
     *) echo "Unknown arg: $1"; exit 2;;
   esac
 done
 
 timestamp() { date -u +"%Y-%m-%d %H:%M:%SZ"; }
 
-printf "\n=== Disk console report (NO FILES) ===\nTime: %s\nInspecting: %s  (top %s)\n\n" "$(timestamp)" "$PATH_TO_CHECK" "$TOP_N"
+printf "\n=== Disk console report (NO FILES) ===\nTime: %s\nInspecting: %s  (top %s, du max-depth=%s)\n\n" "$(timestamp)" "$PATH_TO_CHECK" "$TOP_N" "$DEPTH"
 
-# Show filesystem usage for the path (use df -h on mount containing path)
+# Show filesystem usage for the path (df on the mount containing path)
 df -h "$PATH_TO_CHECK" || df -h
 
-printf "\n--- Top %s directories (depth=1) under %s ---\n" "$TOP_N" "$PATH_TO_CHECK"
-# stay on same filesystem with -x and skip errors
-sudo du -xh --max-depth=1 "$PATH_TO_CHECK" 2>/dev/null \
-  | sort -hr \
+printf "\n--- Top %s directories (du --max-depth=%s) under %s ---\n" "$TOP_N" "$DEPTH" "$PATH_TO_CHECK"
+# Use du with user-specified depth. Suppress errors and avoid broken-pipe noise by redirecting sort stderr.
+# Keep pipeline robust: redirect sort/numfmt stderr and allow non-zero exit without killing script.
+sudo du -xh --max-depth="$DEPTH" "$PATH_TO_CHECK" 2>/dev/null \
+  | sort -hr 2>/dev/null \
   | head -n "$TOP_N" \
-  | awk '{printf "%8s  %s\n",$1,$2}'
+  | awk '{printf "%8s  %s\n",$1,$2}' 2>/dev/null || true
 
 printf "\n--- Top %s files under %s ---\n" "$TOP_N" "$PATH_TO_CHECK"
-# largest files; avoid creating temp files
-sudo find "$PATH_TO_CHECK" -xdev -type f -printf '%s\t%p\n' 2>/dev/null \
-  | sort -nr \
-  | head -n "$TOP_N" \
-  | numfmt --field=1 --to=iec --suffix=B 2>/dev/null \
-  | awk -F"\t" '{printf "%10s\t%s\n",$1,$2}'
+# Avoid broken-pipe by disabling pipefail for this pipeline (encapsulated in a subshell).
+# This ensures `head` can close early without causing an error that aborts the script, while keeping stderr quiet.
+(
+  set +o pipefail
+  sudo find "$PATH_TO_CHECK" -xdev -type f -printf '%s\t%p\n' 2>/dev/null \
+    | sort -nr 2>/dev/null \
+    | head -n "$TOP_N" \
+    | numfmt --field=1 --to=iec --suffix=B 2>/dev/null \
+    | awk -F"\t" '{printf "%10s\t%s\n",$1,$2}' 2>/dev/null
+) || true
 
-printf "\n--- Top %s items (files + dirs) under %s ---\n" "$TOP_N" "$PATH_TO_CHECK"
-sudo du -ahx "$PATH_TO_CHECK" 2>/dev/null \
-  | sort -hr \
-  | head -n "$TOP_N" \
-  | awk '{printf "%8s  %s\n",$1,$2}'
+printf "\n--- Top %s items (files + dirs) under %s (du --max-depth=%s) ---\n" "$TOP_N" "$PATH_TO_CHECK" "$DEPTH"
+(
+  set +o pipefail
+  sudo du -ahx --max-depth="$DEPTH" "$PATH_TO_CHECK" 2>/dev/null \
+    | sort -hr 2>/dev/null \
+    | head -n "$TOP_N" \
+    | awk '{printf "%8s  %s\n",$1,$2}' 2>/dev/null
+) || true
 
 # Candidate cleanup dry-run printer
 print_candidate() {
@@ -117,7 +129,6 @@ fi
 if [ "$PRUNE_DOCKER" -eq 1 ]; then
   printf "\n>>> Docker prune candidate:\n"
   if command -v docker >/dev/null 2>&1; then
-    # show docker disk usage summary
     sudo docker system df || true
     if [ "$ASSUME_YES" -eq 1 ]; then
       printf "\nPruning docker (docker system prune -a --volumes -f)...\n"
@@ -135,7 +146,7 @@ if [ "$AGGRESSIVE" -eq 1 ]; then
   if [ "$ASSUME_YES" -eq 1 ]; then
     printf "\nRemoving aggressive caches (this may lengthen future runs)...\n"
     sudo rm -rf /home/runner/.cache /home/runner/.npm /home/runner/.cache/pip /home/runner/.nuget 2>/dev/null || true
-    # NOTE: /opt/hostedtoolcache is commented out by default — uncomment if you truly want it gone:
+    # /opt/hostedtoolcache is commented out by default — uncomment if you truly want it gone:
     # sudo rm -rf /opt/hostedtoolcache || true
   else
     printf "\nTo actually remove aggressive caches, re-run with --yes\n"

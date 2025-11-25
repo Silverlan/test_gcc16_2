@@ -1,0 +1,86 @@
+name: Build GCC 16 (Ubuntu runner)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-gcc:
+    runs-on: ubuntu-latest
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare & build GCC 16
+        # keep output verbose so you can debug failures
+        shell: bash
+        run: |
+          set -euo pipefail
+          # helpful debug info
+          echo "Runner: $(uname -a)"
+          echo "Free disk:"
+          df -h .
+
+          sudo apt-get update
+
+          # Install dependencies (same list you provided; adapt if packages are unavailable)
+          sudo apt-get install -y --no-install-recommends \
+            autoconf2.69 dwz lzma xz-utils libzstd-dev zlib1g-dev systemtap-sdt-dev \
+            binutils:native binutils-hppa64-linux-gnu:native gettext nvptx-tools amdgcn-tools-18 \
+            texinfo sharutils procps netbase libisl-dev libmpc-dev libmpfr-dev libgmp-dev lib32z1-dev libx32z1-dev
+
+          # Clean apt caches
+          sudo apt-get clean
+
+          # Create directories
+          sudo mkdir -p /root/gcc-16/obj
+          sudo mkdir -p /root/binutils
+
+          # Fetch GCC master (same as your Dockerfile)
+          echo "Downloading GCC source..."
+          curl -L https://github.com/gcc-mirror/gcc/archive/master.tar.gz | sudo tar -xz --strip-components=1 -C /root/gcc-16
+
+          # Fetch binutils
+          echo "Downloading binutils..."
+          curl -L https://sourceware.org/pub/binutils/releases/binutils-2.45.tar.gz | sudo tar -xz --strip-components=1 -C /root/binutils
+
+          # Create symlinks to binutils components in gcc tree (as in Dockerfile)
+          echo "Linking binutils components into gcc tree..."
+          # move into /root/gcc-16 to create links (ensure target exists)
+          cd /root/gcc-16
+          sudo ln -s ../binutils/bfd ../binutils/gas ../binutils/binutils ../binutils/ld ../binutils/libctf \
+            ../binutils/libsframe ../binutils/opcodes . || true
+
+          # Configure & build
+          cd /root/gcc-16/obj
+          echo "Configuring GCC..."
+          sudo ../configure --enable-languages=c,c++,lto --prefix=/opt/gcc-16 --enable-checking=release --disable-bootstrap
+
+          echo "Starting make (this can take a very long time)..."
+          # parallel make; reduce -j if the runner is memory constrained
+          sudo make BOOT_CFLAGS=-march=x86-64-v3 -j3
+
+          echo "Installing..."
+          sudo make -j3 install-strip
+
+          # Update alternatives so the new gcc/g++ are available
+          echo "Registering alternatives..."
+          sudo update-alternatives --install /usr/bin/gcc-16 gcc-16 /opt/gcc-16/bin/gcc 160 --slave /usr/bin/g++-16 g++-16 /opt/gcc-16/bin/g++
+          sudo update-alternatives --install /usr/bin/gcc gcc /opt/gcc-16/bin/gcc 160 --slave /usr/bin/g++ g++ /opt/gcc-16/bin/g++
+
+          # Cleanup source directories
+          cd /root
+          sudo rm -rf /root/gcc-16
+
+          # Remove build-only packages to shrink environment (same list you purged)
+          sudo apt-get purge --autoremove -y \
+            libzstd-dev zlib1g-dev systemtap-sdt-dev \
+            libisl-dev libmpc-dev libmpfr-dev libgmp-dev lib32z1-dev libx32z1-dev
+
+          echo "Done. Installed /opt/gcc-16/bin/gcc"
+          /opt/gcc-16/bin/gcc --version || true

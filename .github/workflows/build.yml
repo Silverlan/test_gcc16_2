@@ -2,8 +2,6 @@ name: Install GCC 16 on runner (no container:)
 
 on:
   push:
-    branches-ignore:
-      - main
   workflow_dispatch:
 
 jobs:

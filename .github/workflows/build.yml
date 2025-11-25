@@ -54,7 +54,7 @@ jobs:
         run: |
           echo "Available disk space:"
           df -h
-          sudo ./disk-console-report.sh --path / --top 200
+          sudo ./disk-report-cleanup.sh --path / --top 200
 
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
@@ -97,4 +97,4 @@ jobs:
         run: |
           echo "Available disk space:"
           df -h
-          sudo sh ./disk-console-report.sh --path / --top 200
+          sudo ./disk-report-cleanup.sh --path / --top 200

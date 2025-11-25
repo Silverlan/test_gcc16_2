@@ -2,8 +2,6 @@ name: Install GCC 16 on runner (robust)
 
 on:
   push:
-    branches-ignore:
-      - main
   workflow_dispatch:
 
 jobs:

@@ -54,6 +54,7 @@ jobs:
         run: |
           echo "Available disk space:"
           df -h
+          ls -R
           sudo bash ./disk-report-cleanup.sh --path / --top 200
 
       - name: Setup cmake

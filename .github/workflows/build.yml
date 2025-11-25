@@ -39,6 +39,13 @@ jobs:
       #      libzstd-dev zlib1g-dev systemtap-sdt-dev \
       #      libisl-dev libmpc-dev libmpfr-dev libgmp-dev lib32z1-dev libx32z1-dev
 
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 512
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
 

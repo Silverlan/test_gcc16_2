@@ -39,6 +39,14 @@ jobs:
       #      libzstd-dev zlib1g-dev systemtap-sdt-dev \
       #      libisl-dev libmpc-dev libmpfr-dev libgmp-dev lib32z1-dev libx32z1-dev
 
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v2
+
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          sudo apt install ninja-build
+
       - name: Setup Pragma
         uses: Silverlan/pragma/github_actions/setup@feat/cxx_modules3
         with:
@@ -59,14 +67,6 @@ jobs:
         run: |
           sudo update-alternatives --install /usr/bin/gcc-16 gcc-16 /opt/gcc-16/bin/gcc 160 --slave /usr/bin/g++-16 g++-16 /opt/gcc-16/bin/g++
           sudo update-alternatives --install /usr/bin/gcc gcc /opt/gcc-16/bin/gcc 160 --slave /usr/bin/g++ g++ /opt/gcc-16/bin/g++
-
-      - name: Setup cmake
-        uses: jwlawson/actions-setup-cmake@v2
-
-      - name: Install Dependencies
-        shell: bash
-        run: |
-          sudo apt install ninja-build
 
       - name: Build Pragma
         uses: ./pragma/github_actions/build

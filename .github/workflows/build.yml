@@ -1,3 +1,7 @@
+name: Check Linux Build (Clang)
+on:
+  push:
+
 jobs:
   build-on-host-then-container:
     runs-on: ubuntu-latest

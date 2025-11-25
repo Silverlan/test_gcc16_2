@@ -179,6 +179,17 @@ jobs:
           gcc --version
           g++ --version
 
+
+
+
+
+      - name: Install sudo (for container)
+        shell: bash
+        run: |
+          apt-get -y install sudo
+          apt-get -y install python-is-python3
+          # apt install libfreetype6-dev
+
       - name: Setup Pragma
         uses: Silverlan/pragma/github_actions/setup@feat/cxx_modules3
         with:

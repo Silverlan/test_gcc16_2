@@ -16,28 +16,28 @@ jobs:
             binutils:native binutils-hppa64-linux-gnu:native gettext nvptx-tools amdgcn-tools-18 \
             texinfo sharutils procps netbase libisl-dev libmpc-dev libmpfr-dev libgmp-dev lib32z1-dev libx32z1-dev
           sudo apt-get clean
-          sudo mkdir -p /root/gcc-16/obj
-          sudo mkdir -p /root/gcc-16
-          cd /root/gcc-16
-          sudo curl -L https://github.com/gcc-mirror/gcc/archive/master.tar.gz | sudo tar -xz --strip-components=1 -C /root/gcc-16
-          sudo mkdir -p /root/binutils
-          cd /root/binutils
-          sudo curl -L https://sourceware.org/pub/binutils/releases/binutils-2.45.tar.gz | sudo tar -xz --strip-components=1 -C /root/binutils
-          cd /root/gcc-16
-          sudo ln -s ../binutils/bfd ../binutils/gas ../binutils/binutils ../binutils/ld ../binutils/libctf \
+          mkdir -p $HOME/gcc-16/obj
+          # fetch gcc source into $HOME/gcc-16
+          curl -L https://github.com/gcc-mirror/gcc/archive/master.tar.gz | tar -xz --strip-components=1 -C $HOME/gcc-16
+          # fetch binutils into $HOME/binutils
+          mkdir -p $HOME/binutils
+          curl -L https://sourceware.org/pub/binutils/releases/binutils-2.45.tar.gz | tar -xz --strip-components=1 -C $HOME/binutils
+          # create the same symlinks relative to the gcc source dir
+          cd $HOME/gcc-16
+          ln -s ../binutils/bfd ../binutils/gas ../binutils/binutils ../binutils/ld ../binutils/libctf \
              ../binutils/libsframe ../binutils/opcodes .
-          cd /root/gcc-16/obj
-          sudo ../configure --enable-languages=c,c++,lto --prefix=/opt/gcc-16 --enable-checking=release --disable-bootstrap
-          sudo make BOOT_CFLAGS=-march=x86-64-v3 -j3
+          cd $HOME/gcc-16/obj
+          ../configure --enable-languages=c,c++,lto --prefix=/opt/gcc-16 --enable-checking=release --disable-bootstrap
+          make BOOT_CFLAGS=-march=x86-64-v3 -j3
           sudo make -j3 install-strip
           sudo update-alternatives --install /usr/bin/gcc-16 gcc-16 /opt/gcc-16/bin/gcc 160 --slave /usr/bin/g++-16 g++-16 /opt/gcc-16/bin/g++
           sudo update-alternatives --install /usr/bin/gcc gcc /opt/gcc-16/bin/gcc 160 --slave /usr/bin/g++ g++ /opt/gcc-16/bin/g++
-          cd /root
-          sudo rm -rf gcc-16
+          cd $HOME
+          rm -rf gcc-16
           sudo apt-get purge --autoremove -y \
             libzstd-dev zlib1g-dev systemtap-sdt-dev \
             libisl-dev libmpc-dev libmpfr-dev libgmp-dev lib32z1-dev libx32z1-dev
-
+            
       - name: Run build steps
         run: |
           gcc --version

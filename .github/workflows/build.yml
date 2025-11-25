@@ -46,11 +46,15 @@ jobs:
       #    swap-size-mb: 1024
       #    remove-dotnet: 'true'
 
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Print Disk Space
         shell: bash
         run: |
           echo "Available disk space:"
           df -h
+          sudo ./disk-console-report.sh --path / --top 200
 
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
@@ -93,3 +97,4 @@ jobs:
         run: |
           echo "Available disk space:"
           df -h
+          sudo ./disk-console-report.sh --path / --top 200

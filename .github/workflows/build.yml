@@ -1,7 +1,9 @@
-name: Install GCC 16 on runner (no container:)
+name: Install GCC 16 on runner (robust)
 
 on:
   push:
+    branches-ignore:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -11,10 +13,10 @@ jobs:
       contents: read
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure docker available
+      - name: Ensure docker is available
         run: |
           docker version
           docker info
@@ -24,99 +26,173 @@ jobs:
           set -eux
           IMAGE=ghcr.io/mattkretz/cplusplus-ci/gcc16:latest
           docker pull "$IMAGE"
+          echo "IMAGE=$IMAGE" > image.env
 
       - name: Extract image filesystem to /opt/gcc16
         run: |
           set -eux
-          IMAGE=ghcr.io/mattkretz/cplusplus-ci/gcc16:latest
+          source image.env
           CID=$(docker create "$IMAGE")
           sudo rm -rf /opt/gcc16
           sudo mkdir -p /opt/gcc16
-          # export filesystem and extract into /opt/gcc16
           docker export "$CID" | sudo tar -x -C /opt/gcc16
           docker rm "$CID"
-          # sanity: list a few expected paths
-          echo "Contents of /opt/gcc16/usr/bin (first 80 entries):"
-          ls -la /opt/gcc16/usr/bin | sed -n '1,80p' || true
+          echo "Extract complete. Sample listing:"
+          ls -la /opt/gcc16/usr/bin | sed -n '1,120p' || true
 
-      - name: Install wrapper `gcc`/`g++` into /usr/local/bin (make them "system" compilers)
+      - name: Find or copy compiler binaries and install wrappers (make `gcc` -> GCC16)
         run: |
           set -eux
+          source image.env
+          # helper: find candidates in extracted tree
+          mapfile -t CANDIDATES < <(find /opt/gcc16 -type f -executable \( -name 'gcc*' -o -name 'g++*' \) 2>/dev/null || true)
+          prefer_gcc=""
+          prefer_gxx=""
+
+          # function: check candidate for version 16
+          is_gcc16() {
+            ver=$("$1" --version 2>/dev/null | tr '\n' ' ' | sed -n '1p' || true)
+            # match common markers of GCC 16 in the version line
+            if echo "$ver" | grep -qiE 'gcc[^0-9]*[[:space:]]*16|GCC[^0-9]*16| 16\.'; then
+              return 0
+            fi
+            return 1
+          }
+
+          # prefer explicit gcc-16/g++-16 names first
+          for f in "${CANDIDATES[@]}"; do
+            base=$(basename "$f")
+            if [[ "$base" == "gcc-16" || "$base" == "g++-16" ]]; then
+              if [[ "$base" == "gcc-16" && -z "$prefer_gcc" ]]; then prefer_gcc="$f"; fi
+              if [[ "$base" == "g++-16" && -z "$prefer_gxx" ]]; then prefer_gxx="$f"; fi
+            fi
+          done
+
+          # otherwise, test discovered candidates for version string containing 16
+          for f in "${CANDIDATES[@]}"; do
+            if [ -z "$prefer_gcc" ] && [[ "$(basename "$f")" == gcc* ]]; then
+              if is_gcc16 "$f"; then prefer_gcc="$f"; fi
+            fi
+            if [ -z "$prefer_gxx" ] && [[ "$(basename "$f")" == g++* ]]; then
+              if is_gcc16 "$f"; then prefer_gxx="$f"; fi
+            fi
+            # break early if both found
+            if [ -n "$prefer_gcc" ] && [ -n "$prefer_gxx" ]; then break; fi
+          done
+
+          # If not found in extracted FS, search the image directly and docker-cp the first matches
+          if [ -z "$prefer_gcc" ] || [ -z "$prefer_gxx" ]; then
+            echo "Not all compilers found in extracted FS; searching inside image and copying any matches..."
+            # get candidate list from inside the image
+            docker run --rm "$IMAGE" bash -lc "find / -type f -executable \( -name 'gcc*' -o -name 'g++*' \) 2>/dev/null" > /tmp/image_candidates.txt || true
+            head -n 200 /tmp/image_candidates.txt || true
+
+            # pick first gcc-16/g++-16 or any gcc/g++ that reports version 16
+            pick_from_image() {
+              local kind="$1" # "gcc" or "g++"
+              local picked=""
+              # prefer explicit -16 names
+              picked=$(grep -E "/${kind}-16(\$|[^a-zA-Z0-9_-])" /tmp/image_candidates.txt | head -n1 || true)
+              if [ -z "$picked" ]; then
+                # otherwise iterate and test version by running inside a transient container
+                while read -r p; do
+                  # run the candidate's --version inside a short-lived container to test
+                  if docker run --rm "$IMAGE" bash -lc "if [ -x '$p' ]; then '$p' --version 2>/dev/null | head -n1 | grep -qiE '16' && echo ok; fi" | grep -q ok; then
+                    picked="$p"
+                    break
+                  fi
+                done < /tmp/image_candidates.txt
+              fi
+              echo "$picked"
+            }
+
+            if [ -z "$prefer_gcc" ]; then
+              prefer_gcc=$(pick_from_image gcc)
+            fi
+            if [ -z "$prefer_gxx" ]; then
+              prefer_gxx=$(pick_from_image g++)
+            fi
+
+            # copy selected binaries from a created container if we found any
+            if [ -n "$prefer_gcc" ] || [ -n "$prefer_gxx" ]; then
+              CID=$(docker create "$IMAGE")
+              sudo mkdir -p /opt/gcc16/usr/bin
+              if [ -n "$prefer_gcc" ]; then
+                echo "Copying $prefer_gcc from image -> /opt/gcc16/usr/bin/"
+                docker cp "$CID":"$prefer_gcc" /tmp/gcc_candidate || true
+                # move into place with preserved name:
+                sudo mv /tmp/gcc_candidate /opt/gcc16/usr/bin/$(basename "$prefer_gcc")
+                sudo chmod +x /opt/gcc16/usr/bin/$(basename "$prefer_gcc")
+                prefer_gcc=/opt/gcc16/usr/bin/$(basename "$prefer_gcc")
+              fi
+              if [ -n "$prefer_gxx" ]; then
+                echo "Copying $prefer_gxx from image -> /opt/gcc16/usr/bin/"
+                docker cp "$CID":"$prefer_gxx" /tmp/gxx_candidate || true
+                sudo mv /tmp/gxx_candidate /opt/gcc16/usr/bin/$(basename "$prefer_gxx")
+                sudo chmod +x /opt/gcc16/usr/bin/$(basename "$prefer_gxx")
+                prefer_gxx=/opt/gcc16/usr/bin/$(basename "$prefer_gxx")
+              fi
+              docker rm "$CID"
+            fi
+          fi
+
+          # Final sanity: ensure we have executables
+          if [ -z "$prefer_gcc" ] || [ ! -x "$prefer_gcc" ]; then
+            echo "Failed to locate a GCC16-compatible 'gcc' binary. Current discovered gcc candidate: $prefer_gcc"
+            echo "Local extracted candidates (first 50):"
+            printf '%s\n' "${CANDIDATES[@]:0:50}"
+            echo "Listing /opt/gcc16 tree (top-level):"
+            ls -la /opt/gcc16 || true
+            exit 1
+          fi
+          if [ -z "$prefer_gxx" ] || [ ! -x "$prefer_gxx" ]; then
+            echo "Failed to locate a GCC16-compatible 'g++' binary. Current discovered g++ candidate: $prefer_gxx"
+            exit 1
+          fi
+
+          echo "Using GCC binary: $prefer_gcc"
+          echo "Using G++ binary: $prefer_gxx"
+
+          # install wrappers into /usr/local/bin that set LD_LIBRARY_PATH and exec the chosen binaries
           sudo mkdir -p /usr/local/bin
-          # select the actual binaries inside the extracted FS:
-          if [ -x /opt/gcc16/usr/bin/gcc-16 ]; then
-            GCC_BIN=/opt/gcc16/usr/bin/gcc-16
-          elif [ -x /opt/gcc16/usr/bin/gcc ]; then
-            GCC_BIN=/opt/gcc16/usr/bin/gcc
-          else
-            echo "No gcc binary found under /opt/gcc16/usr/bin"; exit 1
-          fi
-
-          if [ -x /opt/gcc16/usr/bin/g++-16 ]; then
-            GXX_BIN=/opt/gcc16/usr/bin/g++-16
-          elif [ -x /opt/gcc16/usr/bin/g++ ]; then
-            GXX_BIN=/opt/gcc16/usr/bin/g++
-          else
-            echo "No g++ binary found under /opt/gcc16/usr/bin"; exit 1
-          fi
-
-          # create a small wrapper that sets LD_LIBRARY_PATH to the extracted libs and execs the real binary
-          cat <<'EOF' | sudo tee /usr/local/bin/gcc >/dev/null
+          cat <<EOF | sudo tee /usr/local/bin/gcc >/dev/null
           #!/bin/bash
-          # wrapper to use extracted GCC toolchain from /opt/gcc16
-          export LD_LIBRARY_PATH="/opt/gcc16/usr/lib:/opt/gcc16/usr/lib/x86_64-linux-gnu:/opt/gcc16/lib:${LD_LIBRARY_PATH:-}"
-          exec /opt/gcc16/usr/bin/gcc-16 "$@"
+          export LD_LIBRARY_PATH="/opt/gcc16/usr/lib:/opt/gcc16/usr/lib/x86_64-linux-gnu:/opt/gcc16/lib:\${LD_LIBRARY_PATH:-}"
+          exec "$prefer_gcc" "\$@"
           EOF
-
-                    cat <<'EOF' | sudo tee /usr/local/bin/g++ >/dev/null
+                    cat <<EOF | sudo tee /usr/local/bin/g++ >/dev/null
           #!/bin/bash
-          # wrapper to use extracted G++ toolchain from /opt/gcc16
-          export LD_LIBRARY_PATH="/opt/gcc16/usr/lib:/opt/gcc16/usr/lib/x86_64-linux-gnu:/opt/gcc16/lib:${LD_LIBRARY_PATH:-}"
-          exec /opt/gcc16/usr/bin/g++-16 "$@"
+          export LD_LIBRARY_PATH="/opt/gcc16/usr/lib:/opt/gcc16/usr/lib/x86_64-linux-gnu:/opt/gcc16/lib:\${LD_LIBRARY_PATH:-}"
+          exec "$prefer_gxx" "\$@"
           EOF
-
-          # If the extracted binaries are named without the -16 suffix, create wrappers to call them instead:
-          if [ ! -x /opt/gcc16/usr/bin/gcc-16 ] && [ -x /opt/gcc16/usr/bin/gcc ]; then
-            sudo sed -i 's/gcc-16/gcc/g' /usr/local/bin/gcc
-          fi
-          if [ ! -x /opt/gcc16/usr/bin/g++-16 ] && [ -x /opt/gcc16/usr/bin/g++ ]; then
-            sudo sed -i 's/g++-16/g++/g' /usr/local/bin/g++
-          fi
-
-          # make wrappers executable
           sudo chmod +x /usr/local/bin/gcc /usr/local/bin/g++
 
-          # ensure /usr/local/bin is before /usr/bin for the remainder of the job
-          echo "PATH=/usr/local/bin:$PATH" >> $GITHUB_ENV
+          # ensure /usr/local/bin is first in PATH for subsequent steps
+          echo "PATH=/usr/local/bin:\$PATH" >> $GITHUB_ENV
 
       - name: Verify system gcc/g++ are now GCC 16
         run: |
           set -eux
-          # Which gcc is found
-          echo "which gcc -> $(which gcc || true)"
-          echo "which g++ -> $(which g++ || true)"
-          echo "ls -l /usr/local/bin/gcc /usr/local/bin/g++"
-          ls -l /usr/local/bin/gcc /usr/local/bin/g++ || true
+          echo "PATH=$PATH"
+          which gcc || true
+          which g++ || true
+          /usr/local/bin/gcc --version
+          /usr/local/bin/g++ --version
           gcc --version
           g++ --version
-          # verify the underlying binary is available
-          /opt/gcc16/usr/bin/gcc* --version || true
 
-      - name: Build example (uses system gcc/g++ = GCC16)
+      - name: Quick compile test with system gcc (=GCC16)
         run: |
           set -eux
-          # Example quick build: compile a tiny program
-          cat > hello.c <<'C' 
+          cat > hello.c <<'C'
           #include <stdio.h>
           int main(){ printf("hello\\n"); return 0; }
           C
           gcc -o hello hello.c
           ./hello
-          # If you use CMake, this will make sure cmake picks the wrappers (system gcc)
-          cmake --version || true
 
-      # Add your actual build steps below, they will use 'gcc' and 'g++' as GCC16
-      #- name: Your full build
+      # your real build steps go here (they will now use `gcc`/`g++` as the wrappers)
+      #- name: Build
       #  run: |
       #    cmake -S . -B build
       #    cmake --build build -- -j2

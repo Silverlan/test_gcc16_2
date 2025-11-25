@@ -1,49 +1,124 @@
-name: Install GCC16 from image onto runner
-on: [push]
+name: Install GCC 16 on runner (no container:)
+
+on:
+  push:
+    branches-ignore:
+      - main
+  workflow_dispatch:
 
 jobs:
-  build:
+  install-gcc16:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    permissions:
+      contents: read
 
-      - name: Ensure docker works
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure docker available
         run: |
+          docker version
           docker info
 
-      - name: Pull image & export filesystem into /opt/gcc16
+      - name: Pull GHCR image
         run: |
           set -eux
           IMAGE=ghcr.io/mattkretz/cplusplus-ci/gcc16:latest
-
           docker pull "$IMAGE"
 
-          # create container (no need to run it), then export its filesystem as a tar
+      - name: Extract image filesystem to /opt/gcc16
+        run: |
+          set -eux
+          IMAGE=ghcr.io/mattkretz/cplusplus-ci/gcc16:latest
           CID=$(docker create "$IMAGE")
+          sudo rm -rf /opt/gcc16
           sudo mkdir -p /opt/gcc16
-          # export the container FS and extract under /opt/gcc16
+          # export filesystem and extract into /opt/gcc16
           docker export "$CID" | sudo tar -x -C /opt/gcc16
           docker rm "$CID"
+          # sanity: list a few expected paths
+          echo "Contents of /opt/gcc16/usr/bin (first 80 entries):"
+          ls -la /opt/gcc16/usr/bin | sed -n '1,80p' || true
 
-          # Now /opt/gcc16 contains the image's rootfs.  Inspect as needed:
-          ls -la /opt/gcc16/usr/bin | head -n 20
-
-      - name: Make extracted toolchain visible to subsequent steps
+      - name: Install wrapper `gcc`/`g++` into /usr/local/bin (make them "system" compilers)
         run: |
-          # add the likely bin dirs to PATH for later steps
-          echo "/opt/gcc16/usr/bin" >> $GITHUB_PATH
-          echo "/opt/gcc16/bin" >> $GITHUB_PATH
+          set -eux
+          sudo mkdir -p /usr/local/bin
+          # select the actual binaries inside the extracted FS:
+          if [ -x /opt/gcc16/usr/bin/gcc-16 ]; then
+            GCC_BIN=/opt/gcc16/usr/bin/gcc-16
+          elif [ -x /opt/gcc16/usr/bin/gcc ]; then
+            GCC_BIN=/opt/gcc16/usr/bin/gcc
+          else
+            echo "No gcc binary found under /opt/gcc16/usr/bin"; exit 1
+          fi
 
-          # add common library dirs to LD_LIBRARY_PATH for dynamic linking
-          echo "LD_LIBRARY_PATH=/opt/gcc16/usr/lib:/opt/gcc16/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          if [ -x /opt/gcc16/usr/bin/g++-16 ]; then
+            GXX_BIN=/opt/gcc16/usr/bin/g++-16
+          elif [ -x /opt/gcc16/usr/bin/g++ ]; then
+            GXX_BIN=/opt/gcc16/usr/bin/g++
+          else
+            echo "No g++ binary found under /opt/gcc16/usr/bin"; exit 1
+          fi
 
-      - name: Check gcc/g++ versions from extracted tree
+          # create a small wrapper that sets LD_LIBRARY_PATH to the extracted libs and execs the real binary
+          cat <<'EOF' | sudo tee /usr/local/bin/gcc >/dev/null
+          #!/bin/bash
+          # wrapper to use extracted GCC toolchain from /opt/gcc16
+          export LD_LIBRARY_PATH="/opt/gcc16/usr/lib:/opt/gcc16/usr/lib/x86_64-linux-gnu:/opt/gcc16/lib:${LD_LIBRARY_PATH:-}"
+          exec /opt/gcc16/usr/bin/gcc-16 "$@"
+          EOF
+
+                    cat <<'EOF' | sudo tee /usr/local/bin/g++ >/dev/null
+          #!/bin/bash
+          # wrapper to use extracted G++ toolchain from /opt/gcc16
+          export LD_LIBRARY_PATH="/opt/gcc16/usr/lib:/opt/gcc16/usr/lib/x86_64-linux-gnu:/opt/gcc16/lib:${LD_LIBRARY_PATH:-}"
+          exec /opt/gcc16/usr/bin/g++-16 "$@"
+          EOF
+
+          # If the extracted binaries are named without the -16 suffix, create wrappers to call them instead:
+          if [ ! -x /opt/gcc16/usr/bin/gcc-16 ] && [ -x /opt/gcc16/usr/bin/gcc ]; then
+            sudo sed -i 's/gcc-16/gcc/g' /usr/local/bin/gcc
+          fi
+          if [ ! -x /opt/gcc16/usr/bin/g++-16 ] && [ -x /opt/gcc16/usr/bin/g++ ]; then
+            sudo sed -i 's/g++-16/g++/g' /usr/local/bin/g++
+          fi
+
+          # make wrappers executable
+          sudo chmod +x /usr/local/bin/gcc /usr/local/bin/g++
+
+          # ensure /usr/local/bin is before /usr/bin for the remainder of the job
+          echo "PATH=/usr/local/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Verify system gcc/g++ are now GCC 16
         run: |
+          set -eux
+          # Which gcc is found
+          echo "which gcc -> $(which gcc || true)"
+          echo "which g++ -> $(which g++ || true)"
+          echo "ls -l /usr/local/bin/gcc /usr/local/bin/g++"
+          ls -l /usr/local/bin/gcc /usr/local/bin/g++ || true
           gcc --version
           g++ --version
+          # verify the underlying binary is available
+          /opt/gcc16/usr/bin/gcc* --version || true
 
-      - name: Build (example)
+      - name: Build example (uses system gcc/g++ = GCC16)
         run: |
-          # your build commands here will now use the extracted gcc/g++
-          cmake -S . -B build
-          cmake --build build -- -j2
+          set -eux
+          # Example quick build: compile a tiny program
+          cat > hello.c <<'C' 
+          #include <stdio.h>
+          int main(){ printf("hello\\n"); return 0; }
+          C
+          gcc -o hello hello.c
+          ./hello
+          # If you use CMake, this will make sure cmake picks the wrappers (system gcc)
+          cmake --version || true
+
+      # Add your actual build steps below, they will use 'gcc' and 'g++' as GCC16
+      #- name: Your full build
+      #  run: |
+      #    cmake -S . -B build
+      #    cmake --build build -- -j2

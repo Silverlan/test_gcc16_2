@@ -39,14 +39,6 @@ jobs:
             libzstd-dev zlib1g-dev systemtap-sdt-dev \
             libisl-dev libmpc-dev libmpfr-dev libgmp-dev lib32z1-dev libx32z1-dev
 
-      - name: Run build steps
-        run: |
-          gcc --version
-          which gcc
-
-          find / -type f -name "libstdc++.modules.json"
-          find / -type f -name "gcc-16"
-
       - name: Setup Pragma
         uses: Silverlan/pragma/github_actions/setup@feat/cxx_modules3
         with:

@@ -1,4 +1,4 @@
-name: Build GCC 16 (Ubuntu runner - fixed paths)
+name: Build GCC 16 (Ubuntu runner - 64-bit only)
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Prepare & build GCC 16 (runner-writable paths)
+      - name: Prepare & build GCC 16 (runner-writable paths, 64-bit only)
         shell: bash
         run: |
           set -euo pipefail
@@ -27,19 +27,19 @@ jobs:
 
           sudo apt-get update
 
-          # Install dependencies (same list you provided; adapt if packages are unavailable)
+          # Install dependencies (removed 32-bit dev packages to enforce 64-bit-only build)
           sudo apt-get install -y --no-install-recommends \
             autoconf2.69 dwz lzma xz-utils libzstd-dev zlib1g-dev systemtap-sdt-dev \
             binutils:native binutils-hppa64-linux-gnu:native gettext nvptx-tools amdgcn-tools-18 \
-            texinfo sharutils procps netbase libisl-dev libmpc-dev libmpfr-dev libgmp-dev lib32z1-dev libx32z1-dev
+            texinfo sharutils procps netbase libisl-dev libmpc-dev libmpfr-dev libgmp-dev
 
           sudo apt-get clean
 
           # Use runner-temp & home paths (no /root)
-          GCC_ROOT="${RUNNER_TEMP}/gcc-16"        # will contain the gcc source tree
+          GCC_ROOT="${RUNNER_TEMP}/gcc-16"         # will contain the gcc source tree
           BINUTILS_ROOT="${RUNNER_TEMP}/binutils" # binutils source tree
           BUILD_OBJ="${GCC_ROOT}/obj"
-          GCC_PREFIX="${HOME}/.local/gcc-16"     # install prefix (writable by runner)
+          GCC_PREFIX="${HOME}/.local/gcc-16"      # install prefix (writable by runner)
 
           echo "GCC_ROOT = $GCC_ROOT"
           echo "BINUTILS_ROOT = $BINUTILS_ROOT"
@@ -56,7 +56,6 @@ jobs:
 
           # Create symlinks in the GCC source tree pointing to binutils subdirs (absolute links)
           echo "Linking binutils components into gcc tree..."
-          # Only create links if targets exist
           for sub in bfd gas binutils ld libctf libsframe opcodes; do
             if [ -e "$BINUTILS_ROOT/$sub" ]; then
               ln -sfn "$BINUTILS_ROOT/$sub" "$GCC_ROOT/$sub"
@@ -67,9 +66,9 @@ jobs:
 
           # Configure & build inside BUILD_OBJ
           cd "$BUILD_OBJ"
-          echo "Configuring GCC..."
-          # disable-bootstrap to speed up build; configure writes into obj dir
-          "$GCC_ROOT/configure" --enable-languages=c,c++,lto --prefix="$GCC_PREFIX" --enable-checking=release --disable-bootstrap
+          echo "Configuring GCC (64-bit only)..."
+          # disable-bootstrap to speed up build; add --disable-multilib to avoid 32-bit requirements
+          "$GCC_ROOT/configure" --enable-languages=c,c++,lto --prefix="$GCC_PREFIX" --enable-checking=release --disable-bootstrap --disable-multilib
 
           echo "Starting make (this can take a very long time)..."
           # Adjust -j value if the runner runs out of memory; 2-4 is typical on hosted runners
@@ -80,18 +79,16 @@ jobs:
 
           # Add installed gcc to PATH for remaining steps in this job (no system-wide alternatives)
           echo "Exporting PATH for this job..."
-          echo "GCC_PREFIX=$GCC_PREFIX"
-          export PATH="$GCC_PREFIX/bin:$PATH"
           echo "$GCC_PREFIX/bin" >> $GITHUB_PATH
 
           # Clean up sources to save workspace space
           cd "$RUNNER_TEMP"
           rm -rf "$GCC_ROOT" "$BINUTILS_ROOT"
 
-          # Optionally remove heavy build-only dev packages
+          # Optionally remove heavy build-only dev packages (removed 32-bit dev packages from the purge list)
           sudo apt-get purge --autoremove -y \
             libzstd-dev zlib1g-dev systemtap-sdt-dev \
-            libisl-dev libmpc-dev libmpfr-dev libgmp-dev lib32z1-dev libx32z1-dev || true
+            libisl-dev libmpc-dev libmpfr-dev libgmp-dev || true
 
           echo "Done. Installed $GCC_PREFIX/bin/gcc"
           "$GCC_PREFIX/bin/gcc" --version || true
@@ -101,6 +98,5 @@ jobs:
         run: |
           set -euo pipefail
           set -x
-          # the previous step appended to GITHUB_PATH so gcc should be available
           which gcc || true
           gcc --version || true

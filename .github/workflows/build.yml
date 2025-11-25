@@ -179,15 +179,26 @@ jobs:
           gcc --version
           g++ --version
 
-      - name: Quick compile test with system gcc (=GCC16)
+      - name: Setup Pragma
+        uses: Silverlan/pragma/github_actions/setup@feat/cxx_modules3
+        with:
+          branch: cxx_modules3
+          clone_url: "https://github.com/Silverlan/pragma.git"
+
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v2
+
+      - name: Install Dependencies
+        shell: bash
         run: |
-          set -eux
-          cat > hello.c <<'C'
-          #include <stdio.h>
-          int main(){ printf("hello\\n"); return 0; }
-          C
-          gcc -o hello hello.c
-          ./hello
+          apt install ninja-build
+
+      - name: Build Pragma
+        uses: ./pragma/github_actions/build
+        id: build-pragma
+        with:
+          build-args: '--with-pfm --with-all-pfm-modules --with-vr --with-networking --with-lua-debugger=0 --with-swiftshader --cmake-arg=-DCMAKE_CXX_STDLIB_MODULES_JSON="/opt/gcc-16/lib64/libstdc++.modules.json" --cmake-arg=-DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath,/opt/gcc-16/lib64 -L/opt/gcc-16/lib64" --cmake-cxx-flag="--gcc-toolchain=/opt/gcc-16"'
+            
 
       # your real build steps go here (they will now use `gcc`/`g++` as the wrappers)
       #- name: Build

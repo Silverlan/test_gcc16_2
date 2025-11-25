@@ -1,199 +1,55 @@
-name: Install GCC 16 on runner (robust)
-
+name: Check Linux Build (Clang)
 on:
   push:
-  workflow_dispatch:
+    branches-ignore:
+      - main
+
+concurrency:
+  group: check-build-lin-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # See https://github.com/git-lfs/git-lfs/issues/5749
+  GIT_CLONE_PROTECTION_ACTIVE: 'false'
 
 jobs:
-  install-gcc16:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
+  build:
+    name: Build - ${{ matrix.config.os }}
+    runs-on: ${{ matrix.config.os }}
+    container:
+      image: ghcr.io/mattkretz/cplusplus-ci/gcc16
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - os: ubuntu-latest
+            name: "Ubuntu Latest"
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Ensure docker is available
-        run: |
-          docker version
-          docker info
-
-      - name: Pull GHCR image
-        run: |
-          set -eux
-          IMAGE=ghcr.io/mattkretz/cplusplus-ci/gcc16:latest
-          docker pull "$IMAGE"
-          echo "IMAGE=$IMAGE" > image.env
-
-      - name: Extract image filesystem to /opt/gcc16
-        run: |
-          set -eux
-          source image.env
-          CID=$(docker create "$IMAGE")
-          sudo rm -rf /opt/gcc16
-          sudo mkdir -p /opt/gcc16
-          docker export "$CID" | sudo tar -x -C /opt/gcc16
-          docker rm "$CID"
-          echo "Extract complete. Sample listing:"
-          ls -la /opt/gcc16/usr/bin | sed -n '1,120p' || true
-
-      - name: Find or copy compiler binaries and install wrappers (make `gcc` -> GCC16)
-        run: |
-          set -eux
-          source image.env
-          # helper: find candidates in extracted tree
-          mapfile -t CANDIDATES < <(find /opt/gcc16 -type f -executable \( -name 'gcc*' -o -name 'g++*' \) 2>/dev/null || true)
-          prefer_gcc=""
-          prefer_gxx=""
-
-          # function: check candidate for version 16
-          is_gcc16() {
-            ver=$("$1" --version 2>/dev/null | tr '\n' ' ' | sed -n '1p' || true)
-            # match common markers of GCC 16 in the version line
-            if echo "$ver" | grep -qiE 'gcc[^0-9]*[[:space:]]*16|GCC[^0-9]*16| 16\.'; then
-              return 0
-            fi
-            return 1
-          }
-
-          # prefer explicit gcc-16/g++-16 names first
-          for f in "${CANDIDATES[@]}"; do
-            base=$(basename "$f")
-            if [[ "$base" == "gcc-16" || "$base" == "g++-16" ]]; then
-              if [[ "$base" == "gcc-16" && -z "$prefer_gcc" ]]; then prefer_gcc="$f"; fi
-              if [[ "$base" == "g++-16" && -z "$prefer_gxx" ]]; then prefer_gxx="$f"; fi
-            fi
-          done
-
-          # otherwise, test discovered candidates for version string containing 16
-          for f in "${CANDIDATES[@]}"; do
-            if [ -z "$prefer_gcc" ] && [[ "$(basename "$f")" == gcc* ]]; then
-              if is_gcc16 "$f"; then prefer_gcc="$f"; fi
-            fi
-            if [ -z "$prefer_gxx" ] && [[ "$(basename "$f")" == g++* ]]; then
-              if is_gcc16 "$f"; then prefer_gxx="$f"; fi
-            fi
-            # break early if both found
-            if [ -n "$prefer_gcc" ] && [ -n "$prefer_gxx" ]; then break; fi
-          done
-
-          # If not found in extracted FS, search the image directly and docker-cp the first matches
-          if [ -z "$prefer_gcc" ] || [ -z "$prefer_gxx" ]; then
-            echo "Not all compilers found in extracted FS; searching inside image and copying any matches..."
-            # get candidate list from inside the image
-            docker run --rm "$IMAGE" bash -lc "find / -type f -executable \( -name 'gcc*' -o -name 'g++*' \) 2>/dev/null" > /tmp/image_candidates.txt || true
-            head -n 200 /tmp/image_candidates.txt || true
-
-            # pick first gcc-16/g++-16 or any gcc/g++ that reports version 16
-            pick_from_image() {
-              local kind="$1" # "gcc" or "g++"
-              local picked=""
-              # prefer explicit -16 names
-              picked=$(grep -E "/${kind}-16(\$|[^a-zA-Z0-9_-])" /tmp/image_candidates.txt | head -n1 || true)
-              if [ -z "$picked" ]; then
-                # otherwise iterate and test version by running inside a transient container
-                while read -r p; do
-                  # run the candidate's --version inside a short-lived container to test
-                  if docker run --rm "$IMAGE" bash -lc "if [ -x '$p' ]; then '$p' --version 2>/dev/null | head -n1 | grep -qiE '16' && echo ok; fi" | grep -q ok; then
-                    picked="$p"
-                    break
-                  fi
-                done < /tmp/image_candidates.txt
-              fi
-              echo "$picked"
-            }
-
-            if [ -z "$prefer_gcc" ]; then
-              prefer_gcc=$(pick_from_image gcc)
-            fi
-            if [ -z "$prefer_gxx" ]; then
-              prefer_gxx=$(pick_from_image g++)
-            fi
-
-            # copy selected binaries from a created container if we found any
-            if [ -n "$prefer_gcc" ] || [ -n "$prefer_gxx" ]; then
-              CID=$(docker create "$IMAGE")
-              sudo mkdir -p /opt/gcc16/usr/bin
-              if [ -n "$prefer_gcc" ]; then
-                echo "Copying $prefer_gcc from image -> /opt/gcc16/usr/bin/"
-                docker cp "$CID":"$prefer_gcc" /tmp/gcc_candidate || true
-                # move into place with preserved name:
-                sudo mv /tmp/gcc_candidate /opt/gcc16/usr/bin/$(basename "$prefer_gcc")
-                sudo chmod +x /opt/gcc16/usr/bin/$(basename "$prefer_gcc")
-                prefer_gcc=/opt/gcc16/usr/bin/$(basename "$prefer_gcc")
-              fi
-              if [ -n "$prefer_gxx" ]; then
-                echo "Copying $prefer_gxx from image -> /opt/gcc16/usr/bin/"
-                docker cp "$CID":"$prefer_gxx" /tmp/gxx_candidate || true
-                sudo mv /tmp/gxx_candidate /opt/gcc16/usr/bin/$(basename "$prefer_gxx")
-                sudo chmod +x /opt/gcc16/usr/bin/$(basename "$prefer_gxx")
-                prefer_gxx=/opt/gcc16/usr/bin/$(basename "$prefer_gxx")
-              fi
-              docker rm "$CID"
-            fi
-          fi
-
-          # Final sanity: ensure we have executables
-          if [ -z "$prefer_gcc" ] || [ ! -x "$prefer_gcc" ]; then
-            echo "Failed to locate a GCC16-compatible 'gcc' binary. Current discovered gcc candidate: $prefer_gcc"
-            echo "Local extracted candidates (first 50):"
-            printf '%s\n' "${CANDIDATES[@]:0:50}"
-            echo "Listing /opt/gcc16 tree (top-level):"
-            ls -la /opt/gcc16 || true
-            exit 1
-          fi
-          if [ -z "$prefer_gxx" ] || [ ! -x "$prefer_gxx" ]; then
-            echo "Failed to locate a GCC16-compatible 'g++' binary. Current discovered g++ candidate: $prefer_gxx"
-            exit 1
-          fi
-
-          echo "Using GCC binary: $prefer_gcc"
-          echo "Using G++ binary: $prefer_gxx"
-
-          # install wrappers into /usr/local/bin that set LD_LIBRARY_PATH and exec the chosen binaries
-          sudo mkdir -p /usr/local/bin
-          cat <<EOF | sudo tee /usr/local/bin/gcc >/dev/null
-          #!/bin/bash
-          export LD_LIBRARY_PATH="/opt/gcc16/usr/lib:/opt/gcc16/usr/lib/x86_64-linux-gnu:/opt/gcc16/lib:\${LD_LIBRARY_PATH:-}"
-          exec "$prefer_gcc" "\$@"
-          EOF
-                    cat <<EOF | sudo tee /usr/local/bin/g++ >/dev/null
-          #!/bin/bash
-          export LD_LIBRARY_PATH="/opt/gcc16/usr/lib:/opt/gcc16/usr/lib/x86_64-linux-gnu:/opt/gcc16/lib:\${LD_LIBRARY_PATH:-}"
-          exec "$prefer_gxx" "\$@"
-          EOF
-          sudo chmod +x /usr/local/bin/gcc /usr/local/bin/g++
-
-          # ensure /usr/local/bin is first in PATH for subsequent steps
-          echo "PATH=/usr/local/bin:\$PATH" >> $GITHUB_ENV
-
-      - name: Verify system gcc/g++ are now GCC 16
-        run: |
-          set -eux
-          echo "PATH=$PATH"
-          which gcc || true
-          which g++ || true
-          /usr/local/bin/gcc --version
-          /usr/local/bin/g++ --version
-          gcc --version
-          g++ --version
-
-
-
-
-
       - name: Install sudo (for container)
         shell: bash
         run: |
-          apt install sudo
-          apt install python-is-python3
+          apt-get -y install sudo
+          apt-get -y install python-is-python3
           # apt install libfreetype6-dev
+
+      - name: Install LVM and helper tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y lvm2 util-linux
+          rm -rf /var/lib/apt/lists/*
+
+      - run: df -h
+      - name: "node-cleanup"
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo docker builder prune -a
+      - run: df -h
 
       - name: Setup Pragma
         uses: Silverlan/pragma/github_actions/setup@feat/cxx_modules3
         with:
-          branch: cxx_modules3
+          branch: feat/cxx_modules3
           clone_url: "https://github.com/Silverlan/pragma.git"
 
       - name: Setup cmake
@@ -210,9 +66,30 @@ jobs:
         with:
           build-args: '--with-pfm --with-all-pfm-modules --with-vr --with-networking --with-lua-debugger=0 --with-swiftshader --cmake-arg=-DCMAKE_CXX_STDLIB_MODULES_JSON="/opt/gcc-16/lib64/libstdc++.modules.json" --cmake-arg=-DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath,/opt/gcc-16/lib64 -L/opt/gcc-16/lib64" --cmake-cxx-flag="--gcc-toolchain=/opt/gcc-16"'
             
+      - name: Run Tests
+        uses: ./pragma/github_actions/run_common_tests
+        timeout-minutes: 60
+        with:
+          working-directory: "${{ steps.build-pragma.outputs.install-dir }}"
+          import-tests-token: ${{ secrets.PRAGMA_TESTS_IMPORT_TOKEN }}
 
-      # your real build steps go here (they will now use `gcc`/`g++` as the wrappers)
-      #- name: Build
-      #  run: |
-      #    cmake -S . -B build
-      #    cmake --build build -- -j2
+      #- name: Handle Error
+      #  uses: Silverlan/common_actions/action_handle_error@main
+      #  if: failure()
+      #  with:
+      #    timeout-minutes: 15
+
+      - name: Upload Debug Artifacts
+        if: ${{ !cancelled() }}
+        uses: ./pragma/github_actions/upload_debug_artifacts
+        with:
+          build-dir: '${{ steps.build-pragma.outputs.build-dir }}'
+          deps-dir: '${{ steps.build-pragma.outputs.deps-dir }}'
+          install-dir: '${{ steps.build-pragma.outputs.install-dir }}'
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: pragma-lin64
+          path: ${{ steps.build-pragma.outputs.install-dir }}
+          retention-days: 1

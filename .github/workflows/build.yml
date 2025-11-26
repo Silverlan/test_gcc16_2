@@ -82,7 +82,7 @@ jobs:
 
       - name: Download provided archive
         run: |
-          curl -fL "https://wiki.pragma-engine.com/share/gcc-16-opt.tar.xz" -o /tmp/gcc-16-opt.tar.xz
+          curl -fL "https://github.com/Silverlan/test_build_gcc/releases/download/2025-11-26/gcc-16-opt.tar.xz" -o /tmp/gcc-16-opt.tar.xz
           ls -lh /tmp/gcc-16-opt.tar.xz
 
       - name: Extract to /opt

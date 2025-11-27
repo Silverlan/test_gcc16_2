@@ -25,7 +25,7 @@ jobs:
             generators: "Visual Studio 17 2022"
             build_dir: 'build'
     steps:
-      - name: Windows disk diagnostics (PowerShell, accurate C: view)
+      - name: Windows disk diagnostics (PowerShell, accurate C view)
         shell: pwsh
         run: |
           # don't stop on non-terminating errors

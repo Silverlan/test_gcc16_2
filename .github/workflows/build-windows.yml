@@ -25,54 +25,94 @@ jobs:
             generators: "Visual Studio 17 2022"
             build_dir: 'build'
     steps:
-      - name: Windows disk diagnostics (PowerShell, accurate C view)
+      - name: Windows disk diagnostics (pwsh — tolerant, never fail)
         shell: pwsh
         run: |
-          # don't stop on non-terminating errors
+          # tolerate failures and never return non-zero to GH Actions
           $ErrorActionPreference = 'Continue'
 
           Write-Output "=== Windows disk diagnostics (Get-Volume + top dirs + large files) ==="
           Write-Output "Time: $(Get-Date -AsUTC -Format 'yyyy-MM-dd HH:mm:ssZ')"
 
-          # Drive summary
-          Get-Volume -DriveLetter C | Select-Object DriveLetter, FileSystemLabel, @{N='SizeGB';E={[math]::Round($_.Size/1GB,2)}}, @{N='FreeGB';E={[math]::Round($_.SizeRemaining/1GB,2)}}, @{N='PctFree';E={ if ($_.Size -gt 0) {[math]::Round($_.SizeRemaining/$_.Size*100,1)} else {'N/A'} }} | Format-Table -AutoSize
-
-          Write-Output "`n--- Shadow storage (vss) ---"
-          Try { vssadmin list shadowstorage } Catch { Write-Output "vssadmin: failed or not permitted" }
-
-          Write-Output "`n--- pagefile/hiberfile sizes ---"
-          Try {
-            Get-Item -Path C:\pagefile.sys,C:\hiberfil.sys -ErrorAction SilentlyContinue |
-              Select-Object Name, @{N='SizeGB';E={[math]::Round($_.Length/1GB,3)}} |
+          try {
+            Write-Output "`n--- Drive summary (Get-Volume) ---"
+            Get-Volume -DriveLetter C -ErrorAction SilentlyContinue |
+              Select-Object DriveLetter, FileSystemLabel,
+                @{N='SizeGB';E={[math]::Round($_.Size/1GB,2)}},
+                @{N='FreeGB';E={[math]::Round($_.SizeRemaining/1GB,2)}},
+                @{N='PctFree';E={ if ($_.Size -gt 0) {[math]::Round($_.SizeRemaining/$_.Size*100,1)} else {'N/A'} }} |
               Format-Table -AutoSize
-          } Catch { Write-Output "pagefile check failed" }
+          } catch {
+            Write-Warning "Get-Volume failed: $($_.Exception.Message)"
+          }
 
-          Write-Output "`n--- System Volume Information size (may require admin) ---"
-          Try {
-            $s = Get-ChildItem 'C:\System Volume Information' -Force -Recurse -ErrorAction SilentlyContinue |
-                Measure-Object -Property Length -Sum
+          try {
+            Write-Output "`n--- Shadow storage (vssadmin) ---"
+            vssadmin list shadowstorage 2>&1 | ForEach-Object { Write-Output $_ }
+          } catch {
+            Write-Warning "vssadmin failed: $($_.Exception.Message)"
+          }
+
+          try {
+            Write-Output "`n--- Installed shadow copies (vssadmin list shadows) ---"
+            vssadmin list shadows 2>&1 | ForEach-Object { Write-Output $_ }
+          } catch {
+            Write-Warning "vssadmin list shadows failed: $($_.Exception.Message)"
+          }
+
+          try {
+            Write-Output "`n--- pagefile & hiberfile sizes ---"
+            Get-Item -Path C:\pagefile.sys,C:\hiberfil.sys -ErrorAction SilentlyContinue |
+              Select-Object Name, @{N='SizeGB';E={ if ($_.Length) {[math]::Round($_.Length/1GB,2)} else {'N/A'} }} |
+              Format-Table -AutoSize
+          } catch {
+            Write-Warning "pagefile/hiberfile check failed: $($_.Exception.Message)"
+          }
+
+          try {
+            Write-Output "`n--- System Volume Information summary (may require admin) ---"
+            $s = Get-ChildItem -LiteralPath 'C:\System Volume Information' -Force -Recurse -ErrorAction SilentlyContinue |
+                  Measure-Object -Property Length -Sum
             [PSCustomObject]@{ Path='C:\System Volume Information'; SizeGB = [math]::Round(($s.Sum/1GB),3) } | Format-Table -AutoSize
-          } Catch { Write-Output "SVI check failed" }
+          } catch {
+            Write-Warning "SVI check failed: $($_.Exception.Message)"
+          }
 
-          Write-Output "`n--- Top directories under C:\\ (one level) by aggregated size ---"
-          # Note: this iterates each top-level directory and sums its contents recursively.
-          Get-ChildItem -Path C:\ -Force -Directory -ErrorAction SilentlyContinue |
-            ForEach-Object {
-              $p = $_.FullName
-              $sum = (Get-ChildItem -Path $p -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Measure-Object -Property Length -Sum).Sum
-              [PSCustomObject]@{ Path = $p; SizeBytes = $sum; SizeGB = [math]::Round($sum/1GB,3) }
-            } |
-            Sort-Object SizeBytes -Descending | Select-Object -First 30 |
-            Format-Table SizeGB, Path -AutoSize
+          try {
+            Write-Output "`n--- Top directories under C:\\ (one level) by aggregated size ---"
+            # iterate top-level directories and sum size; -ErrorAction SilentlyContinue to avoid "access denied" stopping us
+            Get-ChildItem -Path C:\ -Force -Directory -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                $p = $_.FullName
+                $sum = 0
+                try {
+                  $sum = (Get-ChildItem -Path $p -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                } catch {
+                  Write-Warning "Failed scanning $p : $($_.Exception.Message)"
+                }
+                [PSCustomObject]@{ Path = $p; SizeBytes = $sum; SizeGB = [math]::Round(($sum/1GB),3) }
+              } |
+              Sort-Object SizeBytes -Descending | Select-Object -First 40 |
+              Format-Table SizeGB, Path -AutoSize
+          } catch {
+            Write-Warning "Top directories scan failed: $($_.Exception.Message)"
+          }
 
-          Write-Output "`n--- Top large files on C: (>=100MB) ---"
-          # Streamed to avoid building huge arrays
-          Get-ChildItem -Path C:\ -Force -Recurse -ErrorAction SilentlyContinue -File |
-            Where-Object { $_.Length -ge 100MB } |
-            Select-Object FullName, @{N='SizeMB';E={[math]::Round($_.Length/1MB,2)}} |
-            Sort-Object SizeMB -Descending |
-            Select-Object -First 50 |
-            Format-Table SizeMB, FullName -AutoSize
+          try {
+            Write-Output "`n--- Top large files on C: (>=100MB) ---"
+            # Stream results to avoid huge memory pressure; suppress non-fatal errors
+            Get-ChildItem -Path C:\ -Force -Recurse -ErrorAction SilentlyContinue -File |
+              Where-Object { $_.Length -ge 100MB } |
+              Select-Object FullName, @{N='SizeMB';E={[math]::Round($_.Length/1MB,2)}} |
+              Sort-Object SizeMB -Descending |
+              Select-Object -First 100 |
+              Format-Table SizeMB, FullName -AutoSize
+          } catch {
+            Write-Warning "Large-file scan failed: $($_.Exception.Message)"
+          }
 
-          Write-Output "`nIf you see large sizes in Pagefile, System Volume Information, or ShadowStorage, those explain the 'missing' 113GB."
+          Write-Output "`nNote: this diagnostic step is intentionally tolerant — it will not fail the job even if parts of the scan hit permission errors."
+          Write-Output "If you want the step to fail on errors, remove the try/catch blocks and change ErrorAction behavior."
 
+          # ALWAYS exit success so the workflow doesn't fail just for diagnostics
+          exit 0

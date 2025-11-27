@@ -25,163 +25,109 @@ jobs:
             generators: "Visual Studio 17 2022"
             build_dir: 'build'
     steps:
-      - name: Print Disk Space (Windows)
-        shell: pwsh
+      - name: Print Disk Space (GitHub Windows runner, bash)
+        shell: bash
         run: |
-          # PowerShell disk-report (rough equivalent of the bash version)
-          # Usage (optional): pass arguments after the script block, e.g.
-          #   --path C:\ --top 50 --depth 5
-          $PathToCheck = 'C:\'
-          $TopN = 25
-          $Depth = 20
+          #!/usr/bin/env bash
+          set -euo pipefail
+          shopt -s nullglob globstar
 
-          # parse args passed to this pwsh run block (if any)
-          for ($i = 0; $i -lt $args.Count; ) {
-            switch ($args[$i]) {
-              '--path' { $PathToCheck = $args[$i + 1]; $i += 2; break }
-              '--top'  { $TopN = [int]$args[$i + 1]; $i += 2; break }
-              '--depth'{ $Depth = [int]$args[$i + 1]; $i += 2; break }
-              '--help' {
-                Write-Output "Reduced disk-report (report-only)"
-                Write-Output "Usage: pass optional flags after the step:"
-                Write-Output "  --path PATH   (default C:\)"
-                Write-Output "  --top  N      (default 25)"
-                Write-Output "  --depth D     (max directory depth to report, default 20)"
-                exit 0
-              }
-              default {
-                Write-Warning "Unknown arg: $($args[$i])"
-                exit 2
-              }
-            }
-          }
+          timestamp(){ date -u +"%Y-%m-%d %H:%M:%SZ"; }
 
-          function Timestamp { (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ssZ') }
+          PATH_TO_CHECK="/"
+          TOP_N=50
+          DEPTH=3
 
-          function Format-Size([Nullable[long]]$bytes) {
-            if ($null -eq $bytes) { return '-' }
-            $b = [double]$bytes
-            switch ($b) {
-              {$_ -ge 1TB} { return "{0:N2} TB" -f ($b / 1TB) }
-              {$_ -ge 1GB} { return "{0:N2} GB" -f ($b / 1GB) }
-              {$_ -ge 1MB} { return "{0:N2} MB" -f ($b / 1MB) }
-              {$_ -ge 1KB} { return "{0:N2} KB" -f ($b / 1KB) }
-              default { return "$bytes B" }
-            }
-          }
+          echo
+          echo "=== Disk console report (mixed POSIX + Windows checks) ==="
+          echo "Time: $(timestamp)"
+          echo "Inspecting (POSIX view): $PATH_TO_CHECK  (top $TOP_N, du depth=$DEPTH)"
+          echo
 
-          # Normalize path
-          try {
-            $resolved = (Resolve-Path -Path $PathToCheck -ErrorAction Stop).Path
-          } catch {
-            Write-Warning "Could not resolve path '$PathToCheck'. Falling back to C:\"
-            $resolved = 'C:\'
-          }
-          $PathToCheck = $resolved.TrimEnd('\')
+          echo "--- df -h for $PATH_TO_CHECK ---"
+          df -h "$PATH_TO_CHECK" || df -h || true
+          echo
 
-          Write-Output ""
-          Write-Output "=== Disk console report (NO FILES) ==="
-          Write-Output "Time: $(Timestamp)"
-          Write-Output "Inspecting: $PathToCheck  (top $TopN, scan max-depth=$Depth)"
-          Write-Output ""
+          echo "--- /proc/mounts (or mount) ---"
+          if [[ -r /proc/mounts ]]; then
+            sed -n '1,200p' /proc/mounts || true
+          else
+            mount 2>/dev/null || true
+          fi
+          echo
 
-          # Show drive / filesystem usage for the path
-          $root = [System.IO.Path]::GetPathRoot($PathToCheck)         # e.g. "C:\"
-          $deviceId = $root.TrimEnd('\')                             # e.g. "C:"
-          $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$deviceId'" -ErrorAction SilentlyContinue
+          echo "--- Top level usage (du --max-depth=1) ---"
+          if du -xh --max-depth=1 "$PATH_TO_CHECK" 2>/dev/null | sort -hr >/dev/null 2>&1; then
+            du -xh --max-depth=1 "$PATH_TO_CHECK" 2>/dev/null | sort -hr
+          elif du -xh -d 1 "$PATH_TO_CHECK" 2>/dev/null | sort -hr >/dev/null 2>&1; then
+            du -xh -d 1 "$PATH_TO_CHECK" 2>/dev/null | sort -hr
+          else
+            du -xh "$PATH_TO_CHECK" 2>/dev/null | sort -hr | head -n 100
+          fi
+          echo
 
-          if ($null -ne $disk) {
-            $size = [int64]$disk.Size
-            $free = [int64]$disk.FreeSpace
-            $used = $size - $free
-            $pctUsed = if ($size -gt 0) { "{0:N1}" -f (100.0 * $used / $size) } else { "?" }
-            Write-Output ("Drive {0}  Size: {1}  Used: {2} ({3}%)  Free: {4}" -f $deviceId,
-                          (Format-Size $size), (Format-Size $used), $pctUsed, (Format-Size $free))
-          } else {
-            # fallback: show PSDrive info
-            Get-PSDrive -PSProvider FileSystem | Format-Table Name, Root, Used, Free, @{Label='Size';Expression={ if ($_.Used -and $_.Free) {Format-Size(($_.Used + $_.Free))} else {'-'}}} -AutoSize
-          }
+          echo "--- Deeper directory scan (may take time) ---"
+          if du -xh --max-depth="$DEPTH" "$PATH_TO_CHECK" 2>/dev/null | sort -hr >/dev/null 2>&1; then
+            du -xh --max-depth="$DEPTH" "$PATH_TO_CHECK" 2>/dev/null | sort -hr | head -n $TOP_N
+          else
+            du -xh -d "$DEPTH" "$PATH_TO_CHECK" 2>/dev/null | sort -hr | head -n $TOP_N || true
+          fi
+          echo
 
-          Write-Output ""
-          Write-Output ("--- Top $TopN directories (aggregated size, depth <= $Depth) under $PathToCheck ---")
+          echo "--- Top $TOP_N files (POSIX) under $PATH_TO_CHECK (this traverses everything) ---"
+          # prefer find -printf; fallback to stat
+          if find "$PATH_TO_CHECK" -type f -printf '%s\t%p\n' 2>/dev/null | head -n 1 >/dev/null 2>&1; then
+            find "$PATH_TO_CHECK" -type f -printf '%s\t%p\n' 2>/dev/null \
+              | sort -nr 2>/dev/null \
+              | head -n $TOP_N \
+              | { if command -v numfmt >/dev/null 2>&1; then numfmt --field=1 --to=iec --suffix=B; else awk -F'\t' '{printf "%12s\t%s\n",$1,$2}'; fi; }
+          elif command -v stat >/dev/null 2>&1; then
+            find "$PATH_TO_CHECK" -type f -print0 2>/dev/null \
+              | xargs -0 -n1 -r stat --printf '%s\t%n\n' 2>/dev/null \
+              | sort -nr 2>/dev/null \
+              | head -n $TOP_N \
+              | { if command -v numfmt >/dev/null 2>&1; then numfmt --field=1 --to=iec --suffix=B; else awk -F'\t' '{printf "%12s\t%s\n",$1,$2}'; fi; }
+          else
+            echo "Skipping file-size listing: find -printf and stat not available"
+          fi
+          echo
 
-          # function to compute depth difference (# of separators relative to base)
-          function Get-RelativeDepth($base, $full) {
-            $b = $base.TrimEnd('\') -split '\\' | Where-Object { $_ -ne '' }
-            $f = $full.TrimEnd('\') -split '\\' | Where-Object { $_ -ne '' }
-            return ($f.Count - $b.Count)
-          }
+          echo "--- Combined top items via du -ah (may be slower) ---"
+          if du -ah --max-depth="$DEPTH" "$PATH_TO_CHECK" 2>/dev/null | sort -hr >/dev/null 2>&1; then
+            du -ah --max-depth="$DEPTH" "$PATH_TO_CHECK" 2>/dev/null | sort -hr | head -n $TOP_N
+          else
+            du -ah "$PATH_TO_CHECK" 2>/dev/null | sort -hr | head -n $TOP_N || true
+          fi
+          echo
 
-          # Gather directories up to requested depth (including base)
-          try {
-            $baseDepth = (Get-Item -LiteralPath $PathToCheck).FullName.TrimEnd('\') -split '\\' | Where-Object { $_ -ne '' } | Measure-Object | Select-Object -ExpandProperty Count
-          } catch {
-            $baseDepth = ($PathToCheck.TrimEnd('\') -split '\\' | Where-Object { $_ -ne '' }).Count
-          }
+          echo "=== Windows-specific checks (via powershell.exe) ==="
+          echo "-- vssadmin (shadow storage) ---"
+          powershell.exe -NoProfile -Command "Try { vssadmin list shadowstorage 2>&1 } Catch { Write-Output \"vssadmin failed or not permitted: \$($_.Exception.Message)\" }"
+          echo
 
-          # Include the base directory itself first
-          $dirList = @()
-          $dirList += Get-Item -LiteralPath $PathToCheck -ErrorAction SilentlyContinue
+          echo "-- Installed shadow copies ---"
+          powershell.exe -NoProfile -Command "Try { vssadmin list shadows 2>&1 } Catch { Write-Output \"vssadmin list shadows failed: \$($_.Exception.Message)\" }"
+          echo
 
-          # Enumerate directories and filter by depth
-          # Use -Recurse; in PowerShell 7 there is -Depth but we keep compatible logic.
-          Write-Output "Scanning directories (this may take a while on large trees)..."
-          $allDirs = Get-ChildItem -LiteralPath $PathToCheck -Directory -Recurse -ErrorAction SilentlyContinue
-          foreach ($d in $allDirs) {
-            $rd = Get-RelativeDepth $PathToCheck $d.FullName
-            if ($rd -le $Depth) { $dirList += $d }
-          }
+          echo "-- pagefile and hiberfile sizes (may require admin) ---"
+          powershell.exe -NoProfile -Command "Get-Item -ErrorAction SilentlyContinue C:\pagefile.sys, C:\hiberfil.sys | Select-Object Name, @{Name='SizeGB';Expression={if (\$_.Length) {[math]::Round(\$_.Length/1GB,2)} else {'N/A'}}} 2>&1"
+          echo
 
-          # Pre-enumerate all files once to speed repeated size calculations
-          $allFiles = Get-ChildItem -LiteralPath $PathToCheck -File -Recurse -ErrorAction SilentlyContinue
+          echo "-- System Volume Information summary (may require admin) ---"
+          powershell.exe -NoProfile -Command "Try { Get-ChildItem -LiteralPath 'C:\System Volume Information' -Force -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum | Select-Object @{N='SizeGB';E={[math]::Round((\$_.Sum/1GB),2)}} } Catch { Write-Output 'Access to System Volume Information failed or empty' }"
+          echo
 
-          $dirSizes = foreach ($d in $dirList) {
-            # sum sizes of files under this directory (including subdirs)
-            $prefix = $d.FullName.TrimEnd('\')
-            $sum = ($allFiles | Where-Object { $_.FullName.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) } | Measure-Object -Property Length -Sum).Sum
-            [PSCustomObject]@{ Path = $d.FullName; Size = [int64]$sum }
-          }
+          echo "-- Recycle Bin totals (per-user) ---"
+          powershell.exe -NoProfile -Command "Try { Get-ChildItem -Path 'C:\$Recycle.Bin' -Force -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum | Select-Object @{N='SizeGB';E={[math]::Round((\$_.Sum/1GB),2)}} } Catch { Write-Output 'Recycle bin query failed' }"
+          echo
 
-          $dirSizes | Sort-Object Size -Descending | Select-Object -First $TopN |
-            ForEach-Object { "{0,12}  {1}" -f (Format-Size $_.Size), $_.Path } | Write-Output
+          echo "-- Disk usage from Windows perspective (Get-Volume) ---"
+          powershell.exe -NoProfile -Command "Get-Volume | Select DriveLetter, FileSystemLabel, @{N='SizeGB';E={[math]::Round($_.Size/1GB,2)}}, @{N='FreeGB';E={[math]::Round($_.SizeRemaining/1GB,2)}}, @{N='PercentFree';E={if (\$_.Size -gt 0) {[math]::Round((\$_.SizeRemaining/\$_.Size*100),1)} else {'N/A'}}}" \
+            || true
+          echo
 
-          Write-Output ""
-          Write-Output ("--- Top $TopN files under $PathToCheck ---")
-          try {
-            Get-ChildItem -LiteralPath $PathToCheck -File -Recurse -ErrorAction SilentlyContinue |
-              Sort-Object Length -Descending |
-              Select-Object -First $TopN |
-              ForEach-Object { "{0,12}  {1}" -f (Format-Size $_.Length), $_.FullName } |
-              Write-Output
-          } catch {
-            Write-Warning "Failed scanning files for top-$TopN files: $_"
-          }
+          echo "--- Note: Sysinternals 'handle.exe' can reveal deleted-but-open files; not present by default on runners ---"
+          echo "If you still can't explain the used space, download and run handle.exe as Admin and run: handle.exe -u C:"
+          echo
 
-          Write-Output ""
-          Write-Output ("--- Top $TopN items (files + dirs) under $PathToCheck (aggregated dir sizes) ---")
-          # Compose combined list: directories (with aggregated sizes) + files
-          $topDirs = $dirSizes | Sort-Object Size -Descending | Select-Object -First $TopN
-          $topFiles = Get-ChildItem -LiteralPath $PathToCheck -File -Recurse -ErrorAction SilentlyContinue |
-                        Sort-Object Length -Descending | Select-Object -First $TopN |
-                        ForEach-Object { [PSCustomObject]@{ Path = $_.FullName; Size = [int64]$_.Length } }
-
-          $combined = @()
-          $combined += $topDirs
-          $combined += $topFiles
-          $combined | Sort-Object Size -Descending | Select-Object -First $TopN |
-            ForEach-Object { "{0,12}  {1}" -f (Format-Size $_.Size), $_.Path } |
-            Write-Output
-
-          Write-Output ""
-          Write-Output ("Final drive usage for $PathToCheck:")
-          if ($null -ne $disk) {
-            Write-Output ("Drive {0}  Size: {1}  Used: {2}  Free: {3}" -f $deviceId, (Format-Size $size), (Format-Size $used), (Format-Size $free))
-          } else {
-            Get-PSDrive -PSProvider FileSystem | Format-Table Name, Root, @{Label='Size';Expression={ if ($_.Used -and $_.Free) {Format-Size(($_.Used + $_.Free))} else {'-'}}}, Used, Free -AutoSize
-          }
-
-          Write-Output ""
-          Write-Output "=== END ==="
-
-          # End of script
-          
+          echo "=== END ==="

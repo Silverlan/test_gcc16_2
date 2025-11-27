@@ -1,8 +1,6 @@
 name: Check Windows Build
 on:
   push:
-    branches-ignore:
-      - main
 
 env:
   # See https://github.com/git-lfs/git-lfs/issues/5749

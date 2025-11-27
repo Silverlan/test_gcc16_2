@@ -25,11 +25,209 @@ jobs:
             generators: "Visual Studio 17 2022"
             build_dir: 'build'
     steps:
-      - name: Setup Pragma
-        uses: Silverlan/pragma/github_actions/setup@main
-        with:
-          branch: feat/cxx_modules3
-          clone_url: "https://github.com/Silverlan/pragma.git"
+      - name: Print Disk Space (Windows, bash)
+        shell: bash
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          shopt -s globstar nullglob
+
+          PATH_TO_CHECK="/"
+          TOP_N=25
+          DEPTH=20
+
+          # parse args
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              --path) PATH_TO_CHECK="$2"; shift 2;;
+              --top)  TOP_N="$2"; shift 2;;
+              --depth) DEPTH="$2"; shift 2;;
+              --help)
+                cat <<'HELP'
+          Reduced disk-report (report-only)
+          Usage: run script with optional flags:
+            --path PATH    path to inspect (Windows or Unix style)
+            --top N        how many top items to show (default 25)
+            --depth D      max-depth for du (default 20)
+          HELP
+                exit 0
+                ;;
+              *) echo "Unknown arg: $1" >&2; exit 2;;
+            esac
+          done
+
+          timestamp(){ date -u +"%Y-%m-%d %H:%M:%SZ"; }
+
+          # convert common Windows paths (C:\ or C:/) into a bash-y path
+          convert_path_for_bash() {
+            local p="$1"
+            # if WSL available, prefer wslpath
+            if command -v wslpath >/dev/null 2>&1; then
+              # wslpath -a makes absolute; ignore failures
+              if out=$(wslpath -a "$p" 2>/dev/null); then
+                printf '%s' "$out"
+                return 0
+              fi
+            fi
+
+            # Normalize forward slashes
+            p="${p//\\//}"
+
+            # If already looks Unix-like, return as-is
+            if [[ "$p" == /* ]]; then
+              printf '%s' "$p"
+              return 0
+            fi
+
+            # Windows drive letter form: C:/path or C:
+            if [[ "$p" =~ ^([A-Za-z]):(.*)$ ]]; then
+              drive="${BASH_REMATCH[1],,}"    # lowercase
+              rest="${BASH_REMATCH[2]}"
+              # prefer /mnt/c/... when present (WSL style)
+              if [[ -d "/mnt/$drive" ]]; then
+                if [[ -z "$rest" || "$rest" == "/" ]]; then
+                  printf '/mnt/%s/' "$drive"
+                else
+                  # strip leading slash from rest
+                  rest="${rest#/}"
+                  printf '/mnt/%s/%s' "$drive" "$rest"
+                fi
+                return 0
+              fi
+              # fallback to Git-for-Windows style: /c/...
+              if [[ -d "/$drive" || -d "/$drive/" || -d "/$drive/." ]]; then
+                rest="${rest#/}"
+                if [[ -z "$rest" ]]; then
+                  printf '/%s/' "$drive"
+                else
+                  printf '/%s/%s' "$drive" "$rest"
+                fi
+                return 0
+              fi
+              # ultimate fallback: /$drive/...
+              rest="${rest#/}"
+              printf '/%s/%s' "$drive" "$rest"
+              return 0
+            fi
+
+            # otherwise return original
+            printf '%s' "$p"
+          }
+
+          # Use converted path for scanning
+          SCAN_PATH="$(convert_path_for_bash "$PATH_TO_CHECK")"
+          # If path doesn't exist, warn and fall back to root
+          if [[ ! -e "$SCAN_PATH" ]]; then
+            echo "Warning: resolved path '$SCAN_PATH' does not exist. Falling back to /"
+            SCAN_PATH="/"
+          fi
+
+          # prefer sudo if available and not running as root
+          SUDO=""
+          if command -v sudo >/dev/null 2>&1 && [[ "$(id -u)" -ne 0 ]]; then
+            SUDO="sudo"
+          fi
+
+          echo
+          echo "=== Disk console report (NO FILES) ==="
+          printf "Time: %s\nInspecting: %s  (top %s, du max-depth=%s)\n\n" "$(timestamp)" "$PATH_TO_CHECK" "$TOP_N" "$DEPTH"
+
+          # df for the container/mount containing path
+          if df -h "$SCAN_PATH" >/dev/null 2>&1; then
+            echo "Available disk space:"
+            df -h "$SCAN_PATH" || df -h
+          else
+            echo "df not available or failed; listing mount-ish info via /proc/mounts (if available):"
+            if [[ -r /proc/mounts ]]; then
+              grep -E "^[^ ]+ " /proc/mounts || true
+            fi
+          fi
+
+          # Helper: try du with GNU long option, else BSD style
+          du_maxdepth_opt() {
+            if du --version >/dev/null 2>&1; then
+              # GNU du
+              printf -- "--max-depth=%s" "$1"
+            else
+              # BSD du or busybox; use -d if supported, else empty (may be slow)
+              if du -d 1 "$SCAN_PATH" >/dev/null 2>&1; then
+                printf -- "-d %s" "$1"
+              else
+                # no depth option
+                printf ""
+              fi
+            fi
+          }
+
+          DU_DEPTH_OPT="$(du_maxdepth_opt "$DEPTH")"
+
+          printf "\n--- Top %s directories (du %s) under %s ---\n" "$TOP_N" "$DU_DEPTH_OPT" "$SCAN_PATH"
+          # prefer du -xh for human readable with apparent size
+          (
+            set +o pipefail
+            if [[ -n "$DU_DEPTH_OPT" ]]; then
+              # Use eval to expand the option string correctly
+              eval $SUDO du -xh $DU_DEPTH_OPT "$SCAN_PATH" 2>/dev/null \
+                | sort -hr 2>/dev/null \
+                | head -n "$TOP_N" \
+                | awk '{printf "%8s  %s\n",$1,$2}' 2>/dev/null || true
+            else
+              # fallback: no depth option -> use du -xh and filter by path depth manually
+              $SUDO du -xh "$SCAN_PATH" 2>/dev/null \
+                | sort -hr 2>/dev/null \
+                | head -n "$TOP_N" \
+                | awk '{printf "%8s  %s\n",$1,$2}' 2>/dev/null || true
+            fi
+          )
+
+          printf "\n--- Top %s files under %s ---\n" "$TOP_N" "$SCAN_PATH"
+          # Try GNU find -printf fallback to using stat if not available
+          (
+            set +o pipefail
+            if find "$SCAN_PATH" -xdev -type f -printf '%s\t%p\n' 2>/dev/null | head -n 1 >/dev/null 2>&1; then
+              $SUDO find "$SCAN_PATH" -xdev -type f -printf '%s\t%p\n' 2>/dev/null \
+                | sort -nr 2>/dev/null \
+                | head -n "$TOP_N" \
+                | ( if command -v numfmt >/dev/null 2>&1; then numfmt --field=1 --to=iec --suffix=B; else awk 'function hr(n){
+                      s="BKMGTPEZY"; i=1;
+                      while(n>1024 && i<length(s)){ n/=1024; i++ }
+                      return sprintf("%.2f %sB", n, substr(s,i,1))
+                    } { printf "%10s\t%s\n", $1, $2 }' ; fi )
+            else
+              # find -printf not available; use find -> xargs stat (platform dependent)
+              if command -v stat >/dev/null 2>&1; then
+                $SUDO find "$SCAN_PATH" -xdev -type f -print0 2>/dev/null \
+                  | xargs -0 -n1 -r stat --format '%s\t%n' 2>/dev/null \
+                  | sort -nr 2>/dev/null \
+                  | head -n "$TOP_N" \
+                  | ( if command -v numfmt >/dev/null 2>&1; then numfmt --field=1 --to=iec --suffix=B; else awk '{ printf "%10s\t%s\n", $1, $2 }' ; fi )
+              else
+                echo "Unable to enumerate file sizes with find/stat on this environment."
+              fi
+            fi
+          ) || true
+
+          printf "\n--- Top %s items (files + dirs) under %s (du %s) ---\n" "$TOP_N" "$SCAN_PATH" "$DU_DEPTH_OPT"
+          (
+            set +o pipefail
+            if [[ -n "$DU_DEPTH_OPT" ]]; then
+              eval $SUDO du -ahx $DU_DEPTH_OPT "$SCAN_PATH" 2>/dev/null \
+                | sort -hr 2>/dev/null \
+                | head -n "$TOP_N" \
+                | awk '{printf "%8s  %s\n",$1,$2}' 2>/dev/null
+            else
+              $SUDO du -ahx "$SCAN_PATH" 2>/dev/null \
+                | sort -hr 2>/dev/null \
+                | head -n "$TOP_N" \
+                | awk '{printf "%8s  %s\n",$1,$2}' 2>/dev/null
+            fi
+          ) || true
+
+          printf "\nFinal df -h for %s:\n" "$SCAN_PATH"
+          df -h "$SCAN_PATH" || df -h || true
+
+          printf "\n=== END ===\n"
+
 
       # We need the latest Windows SDK
       - uses: GuillaumeFalourd/setup-windows10-sdk-action@v1.11

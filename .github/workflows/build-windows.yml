@@ -25,85 +25,109 @@ jobs:
             generators: "Visual Studio 17 2022"
             build_dir: 'build'
     steps:
-      - name: Windows disk diagnostics (pwsh — tolerant, never fail)
+      - name: Windows disk diagnostics — multi-depth (pwsh, tolerant)
         shell: pwsh
         run: |
-          # tolerate failures and never return non-zero to GH Actions
+          # tolerant diagnostics: aggregate sizes by multiple depths in one pass
           $ErrorActionPreference = 'Continue'
 
-          Write-Output "=== Windows disk diagnostics (Get-Volume + top dirs + large files) ==="
+          $Base = 'C:\'
+          $MaxDepth = 4    # how many directory levels to aggregate (1 = top-level children, 2 = grandchildren, ...)
+          $TopN = 30       # how many top entries to display per depth
+
+          Write-Output "=== Multi-depth Windows disk diagnostics ==="
           Write-Output "Time: $(Get-Date -AsUTC -Format 'yyyy-MM-dd HH:mm:ssZ')"
+          Write-Output "Base: $Base  MaxDepth: $MaxDepth  TopN: $TopN"
+          Write-Output ""
 
           try {
-            Write-Output "`n--- Drive summary (Get-Volume) ---"
-            Get-Volume -DriveLetter C -ErrorAction SilentlyContinue |
-              Select-Object DriveLetter, FileSystemLabel,
-                @{N='SizeGB';E={[math]::Round($_.Size/1GB,2)}},
-                @{N='FreeGB';E={[math]::Round($_.SizeRemaining/1GB,2)}},
-                @{N='PctFree';E={ if ($_.Size -gt 0) {[math]::Round($_.SizeRemaining/$_.Size*100,1)} else {'N/A'} }} |
+            # normalize base path (ensure trailing backslash)
+            $baseItem = Get-Item -LiteralPath $Base -ErrorAction SilentlyContinue
+            if ($null -ne $baseItem) {
+              $baseNorm = $baseItem.FullName.TrimEnd('\') + '\'
+            } else {
+              $baseNorm = (Resolve-Path -LiteralPath $Base -ErrorAction SilentlyContinue).Path.TrimEnd('\') + '\'
+            }
+          } catch {
+            $baseNorm = $Base.TrimEnd('\') + '\'
+          }
+
+          Write-Output "Normalized base path: $baseNorm"
+          Write-Output ""
+
+          # Drive summary
+          try {
+            Write-Output "--- Drive summary (Get-Volume) ---"
+            Get-Volume -DriveLetter ($baseNorm.Substring(0,1)) -ErrorAction SilentlyContinue |
+              Select-Object DriveLetter, @{N='Label';E={$_.FileSystemLabel}}, @{N='SizeGB';E={[math]::Round($_.Size/1GB,2)}}, @{N='FreeGB';E={[math]::Round($_.SizeRemaining/1GB,2)}}, @{N='PctFree';E={ if ($_.Size -gt 0) {[math]::Round($_.SizeRemaining/$_.Size*100,1)} else {'N/A'} }} |
               Format-Table -AutoSize
           } catch {
             Write-Warning "Get-Volume failed: $($_.Exception.Message)"
           }
+          Write-Output ""
+
+          # prepare aggregation tables: depth -> hashtable(path -> sizeBytes)
+          $agg = @{}
+          for ($d = 1; $d -le $MaxDepth; $d++) { $agg[$d] = @{} }
+
+          Write-Output "Scanning files (this may take a while for large images). Streaming aggregation..."
+          Write-Output ""
 
           try {
-            Write-Output "`n--- Shadow storage (vssadmin) ---"
-            vssadmin list shadowstorage 2>&1 | ForEach-Object { Write-Output $_ }
-          } catch {
-            Write-Warning "vssadmin failed: $($_.Exception.Message)"
-          }
+            # Stream all files under base once, aggregate into depth buckets.
+            # Use -File to avoid enumerating directories as items here.
+            Get-ChildItem -LiteralPath $baseNorm -Force -Recurse -ErrorAction SilentlyContinue -File |
+              ForEach-Object -Process {
+                $f = $_
+                # ensure file is on same normalized base (defensive)
+                if (-not $f.FullName.StartsWith($baseNorm, [System.StringComparison]::OrdinalIgnoreCase)) { return }
 
-          try {
-            Write-Output "`n--- Installed shadow copies (vssadmin list shadows) ---"
-            vssadmin list shadows 2>&1 | ForEach-Object { Write-Output $_ }
-          } catch {
-            Write-Warning "vssadmin list shadows failed: $($_.Exception.Message)"
-          }
+                $rel = $f.FullName.Substring($baseNorm.Length).TrimStart('\')
+                if ($rel -eq '') { return }   # skip weird root-level matching
+                $parts = $rel -split '\\'
+                $count = $parts.Count
 
-          try {
-            Write-Output "`n--- pagefile & hiberfile sizes ---"
-            Get-Item -Path C:\pagefile.sys,C:\hiberfil.sys -ErrorAction SilentlyContinue |
-              Select-Object Name, @{N='SizeGB';E={ if ($_.Length) {[math]::Round($_.Length/1GB,2)} else {'N/A'} }} |
-              Format-Table -AutoSize
-          } catch {
-            Write-Warning "pagefile/hiberfile check failed: $($_.Exception.Message)"
-          }
-
-          try {
-            Write-Output "`n--- System Volume Information summary (may require admin) ---"
-            $s = Get-ChildItem -LiteralPath 'C:\System Volume Information' -Force -Recurse -ErrorAction SilentlyContinue |
-                  Measure-Object -Property Length -Sum
-            [PSCustomObject]@{ Path='C:\System Volume Information'; SizeGB = [math]::Round(($s.Sum/1GB),3) } | Format-Table -AutoSize
-          } catch {
-            Write-Warning "SVI check failed: $($_.Exception.Message)"
-          }
-
-          try {
-            Write-Output "`n--- Top directories under C:\\ (one level) by aggregated size ---"
-            # iterate top-level directories and sum size; -ErrorAction SilentlyContinue to avoid "access denied" stopping us
-            Get-ChildItem -Path C:\ -Force -Directory -ErrorAction SilentlyContinue |
-              ForEach-Object {
-                $p = $_.FullName
-                $sum = 0
-                try {
-                  $sum = (Get-ChildItem -Path $p -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
-                } catch {
-                  Write-Warning "Failed scanning $p : $($_.Exception.Message)"
+                # accumulate file size for each ancestor up to MaxDepth
+                for ($d = 1; $d -le $MaxDepth; $d++) {
+                  if ($count -lt $d) { break }
+                  $sub = ($parts[0..($d-1)] -join '\')
+                  $key = ($baseNorm.TrimEnd('\') + '\' + $sub).TrimEnd('\')
+                  if (-not $agg[$d].ContainsKey($key)) { $agg[$d][$key] = 0 }
+                  $agg[$d][$key] += [int64]$f.Length
                 }
-                [PSCustomObject]@{ Path = $p; SizeBytes = $sum; SizeGB = [math]::Round(($sum/1GB),3) }
-              } |
-              Sort-Object SizeBytes -Descending | Select-Object -First 40 |
-              Format-Table SizeGB, Path -AutoSize
+              }
           } catch {
-            Write-Warning "Top directories scan failed: $($_.Exception.Message)"
+            Write-Warning "File scan failed or was partially interrupted: $($_.Exception.Message)"
           }
 
+          Write-Output "`n--- Aggregated top directories by depth ---`n"
+
+          for ($d = 1; $d -le $MaxDepth; $d++) {
+            Write-Output ">>> Top $TopN directories at depth $d (aggregated size of files beneath each):"
+            try {
+              $pairs = $agg[$d].GetEnumerator() | Sort-Object Value -Descending | Select-Object -First $TopN
+              if ($pairs.Count -eq 0) {
+                Write-Output "  (no entries found at depth $d — maybe permission errors or empty)"
+              } else {
+                $pairs | ForEach-Object {
+                  [PSCustomObject]@{
+                    SizeGB = [math]::Round($_.Value / 1GB, 3)
+                    SizeMB = [math]::Round($_.Value / 1MB, 1)
+                    Path   = $_.Key
+                  }
+                } | Format-Table SizeGB, SizeMB, Path -AutoSize
+              }
+            } catch {
+              Write-Warning "Aggregation/printing failed for depth $d: $($_.Exception.Message)"
+            }
+            Write-Output ""
+          }
+
+          Write-Output "--- Top large files on $baseNorm (>=100MB) ---"
           try {
-            Write-Output "`n--- Top large files on C: (>=100MB) ---"
-            # Stream results to avoid huge memory pressure; suppress non-fatal errors
-            Get-ChildItem -Path C:\ -Force -Recurse -ErrorAction SilentlyContinue -File |
+            Get-ChildItem -LiteralPath $baseNorm -Force -Recurse -ErrorAction SilentlyContinue -File |
               Where-Object { $_.Length -ge 100MB } |
-              Select-Object FullName, @{N='SizeMB';E={[math]::Round($_.Length/1MB,2)}} |
+              Select-Object @{N='SizeMB';E={[math]::Round($_.Length/1MB,2)}}, FullName |
               Sort-Object SizeMB -Descending |
               Select-Object -First 100 |
               Format-Table SizeMB, FullName -AutoSize
@@ -111,8 +135,11 @@ jobs:
             Write-Warning "Large-file scan failed: $($_.Exception.Message)"
           }
 
-          Write-Output "`nNote: this diagnostic step is intentionally tolerant — it will not fail the job even if parts of the scan hit permission errors."
-          Write-Output "If you want the step to fail on errors, remove the try/catch blocks and change ErrorAction behavior."
+          Write-Output ""
+          Write-Output "Note: aggregation is derived from file sizes only (folders themselves have negligible intrinsic size)."
+          Write-Output "If you need deeper MaxDepth (or faster scanning), reduce scanning scope (e.g. target C:\Program Files) or increase runner resources."
+          Write-Output ""
+          Write-Output "=== END ==="
 
-          # ALWAYS exit success so the workflow doesn't fail just for diagnostics
+          # Always succeed — diagnostics only
           exit 0

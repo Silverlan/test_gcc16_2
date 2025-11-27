@@ -25,109 +25,54 @@ jobs:
             generators: "Visual Studio 17 2022"
             build_dir: 'build'
     steps:
-      - name: Print Disk Space (GitHub Windows runner, bash)
-        shell: bash
+      - name: Windows disk diagnostics (PowerShell, accurate C: view)
+        shell: pwsh
         run: |
-          #!/usr/bin/env bash
-          set -euo pipefail
-          shopt -s nullglob globstar
+          # don't stop on non-terminating errors
+          $ErrorActionPreference = 'Continue'
 
-          timestamp(){ date -u +"%Y-%m-%d %H:%M:%SZ"; }
+          Write-Output "=== Windows disk diagnostics (Get-Volume + top dirs + large files) ==="
+          Write-Output "Time: $(Get-Date -AsUTC -Format 'yyyy-MM-dd HH:mm:ssZ')"
 
-          PATH_TO_CHECK="/"
-          TOP_N=50
-          DEPTH=3
+          # Drive summary
+          Get-Volume -DriveLetter C | Select-Object DriveLetter, FileSystemLabel, @{N='SizeGB';E={[math]::Round($_.Size/1GB,2)}}, @{N='FreeGB';E={[math]::Round($_.SizeRemaining/1GB,2)}}, @{N='PctFree';E={ if ($_.Size -gt 0) {[math]::Round($_.SizeRemaining/$_.Size*100,1)} else {'N/A'} }} | Format-Table -AutoSize
 
-          echo
-          echo "=== Disk console report (mixed POSIX + Windows checks) ==="
-          echo "Time: $(timestamp)"
-          echo "Inspecting (POSIX view): $PATH_TO_CHECK  (top $TOP_N, du depth=$DEPTH)"
-          echo
+          Write-Output "`n--- Shadow storage (vss) ---"
+          Try { vssadmin list shadowstorage } Catch { Write-Output "vssadmin: failed or not permitted" }
 
-          echo "--- df -h for $PATH_TO_CHECK ---"
-          df -h "$PATH_TO_CHECK" || df -h || true
-          echo
+          Write-Output "`n--- pagefile/hiberfile sizes ---"
+          Try {
+            Get-Item -Path C:\pagefile.sys,C:\hiberfil.sys -ErrorAction SilentlyContinue |
+              Select-Object Name, @{N='SizeGB';E={[math]::Round($_.Length/1GB,3)}} |
+              Format-Table -AutoSize
+          } Catch { Write-Output "pagefile check failed" }
 
-          echo "--- /proc/mounts (or mount) ---"
-          if [[ -r /proc/mounts ]]; then
-            sed -n '1,200p' /proc/mounts || true
-          else
-            mount 2>/dev/null || true
-          fi
-          echo
+          Write-Output "`n--- System Volume Information size (may require admin) ---"
+          Try {
+            $s = Get-ChildItem 'C:\System Volume Information' -Force -Recurse -ErrorAction SilentlyContinue |
+                Measure-Object -Property Length -Sum
+            [PSCustomObject]@{ Path='C:\System Volume Information'; SizeGB = [math]::Round(($s.Sum/1GB),3) } | Format-Table -AutoSize
+          } Catch { Write-Output "SVI check failed" }
 
-          echo "--- Top level usage (du --max-depth=1) ---"
-          if du -xh --max-depth=1 "$PATH_TO_CHECK" 2>/dev/null | sort -hr >/dev/null 2>&1; then
-            du -xh --max-depth=1 "$PATH_TO_CHECK" 2>/dev/null | sort -hr
-          elif du -xh -d 1 "$PATH_TO_CHECK" 2>/dev/null | sort -hr >/dev/null 2>&1; then
-            du -xh -d 1 "$PATH_TO_CHECK" 2>/dev/null | sort -hr
-          else
-            du -xh "$PATH_TO_CHECK" 2>/dev/null | sort -hr | head -n 100
-          fi
-          echo
+          Write-Output "`n--- Top directories under C:\\ (one level) by aggregated size ---"
+          # Note: this iterates each top-level directory and sums its contents recursively.
+          Get-ChildItem -Path C:\ -Force -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              $p = $_.FullName
+              $sum = (Get-ChildItem -Path $p -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Measure-Object -Property Length -Sum).Sum
+              [PSCustomObject]@{ Path = $p; SizeBytes = $sum; SizeGB = [math]::Round($sum/1GB,3) }
+            } |
+            Sort-Object SizeBytes -Descending | Select-Object -First 30 |
+            Format-Table SizeGB, Path -AutoSize
 
-          echo "--- Deeper directory scan (may take time) ---"
-          if du -xh --max-depth="$DEPTH" "$PATH_TO_CHECK" 2>/dev/null | sort -hr >/dev/null 2>&1; then
-            du -xh --max-depth="$DEPTH" "$PATH_TO_CHECK" 2>/dev/null | sort -hr | head -n $TOP_N
-          else
-            du -xh -d "$DEPTH" "$PATH_TO_CHECK" 2>/dev/null | sort -hr | head -n $TOP_N || true
-          fi
-          echo
+          Write-Output "`n--- Top large files on C: (>=100MB) ---"
+          # Streamed to avoid building huge arrays
+          Get-ChildItem -Path C:\ -Force -Recurse -ErrorAction SilentlyContinue -File |
+            Where-Object { $_.Length -ge 100MB } |
+            Select-Object FullName, @{N='SizeMB';E={[math]::Round($_.Length/1MB,2)}} |
+            Sort-Object SizeMB -Descending |
+            Select-Object -First 50 |
+            Format-Table SizeMB, FullName -AutoSize
 
-          echo "--- Top $TOP_N files (POSIX) under $PATH_TO_CHECK (this traverses everything) ---"
-          # prefer find -printf; fallback to stat
-          if find "$PATH_TO_CHECK" -type f -printf '%s\t%p\n' 2>/dev/null | head -n 1 >/dev/null 2>&1; then
-            find "$PATH_TO_CHECK" -type f -printf '%s\t%p\n' 2>/dev/null \
-              | sort -nr 2>/dev/null \
-              | head -n $TOP_N \
-              | { if command -v numfmt >/dev/null 2>&1; then numfmt --field=1 --to=iec --suffix=B; else awk -F'\t' '{printf "%12s\t%s\n",$1,$2}'; fi; }
-          elif command -v stat >/dev/null 2>&1; then
-            find "$PATH_TO_CHECK" -type f -print0 2>/dev/null \
-              | xargs -0 -n1 -r stat --printf '%s\t%n\n' 2>/dev/null \
-              | sort -nr 2>/dev/null \
-              | head -n $TOP_N \
-              | { if command -v numfmt >/dev/null 2>&1; then numfmt --field=1 --to=iec --suffix=B; else awk -F'\t' '{printf "%12s\t%s\n",$1,$2}'; fi; }
-          else
-            echo "Skipping file-size listing: find -printf and stat not available"
-          fi
-          echo
+          Write-Output "`nIf you see large sizes in Pagefile, System Volume Information, or ShadowStorage, those explain the 'missing' 113GB."
 
-          echo "--- Combined top items via du -ah (may be slower) ---"
-          if du -ah --max-depth="$DEPTH" "$PATH_TO_CHECK" 2>/dev/null | sort -hr >/dev/null 2>&1; then
-            du -ah --max-depth="$DEPTH" "$PATH_TO_CHECK" 2>/dev/null | sort -hr | head -n $TOP_N
-          else
-            du -ah "$PATH_TO_CHECK" 2>/dev/null | sort -hr | head -n $TOP_N || true
-          fi
-          echo
-
-          echo "=== Windows-specific checks (via powershell.exe) ==="
-          echo "-- vssadmin (shadow storage) ---"
-          powershell.exe -NoProfile -Command "Try { vssadmin list shadowstorage 2>&1 } Catch { Write-Output \"vssadmin failed or not permitted: \$($_.Exception.Message)\" }"
-          echo
-
-          echo "-- Installed shadow copies ---"
-          powershell.exe -NoProfile -Command "Try { vssadmin list shadows 2>&1 } Catch { Write-Output \"vssadmin list shadows failed: \$($_.Exception.Message)\" }"
-          echo
-
-          echo "-- pagefile and hiberfile sizes (may require admin) ---"
-          powershell.exe -NoProfile -Command "Get-Item -ErrorAction SilentlyContinue C:\pagefile.sys, C:\hiberfil.sys | Select-Object Name, @{Name='SizeGB';Expression={if (\$_.Length) {[math]::Round(\$_.Length/1GB,2)} else {'N/A'}}} 2>&1"
-          echo
-
-          echo "-- System Volume Information summary (may require admin) ---"
-          powershell.exe -NoProfile -Command "Try { Get-ChildItem -LiteralPath 'C:\System Volume Information' -Force -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum | Select-Object @{N='SizeGB';E={[math]::Round((\$_.Sum/1GB),2)}} } Catch { Write-Output 'Access to System Volume Information failed or empty' }"
-          echo
-
-          echo "-- Recycle Bin totals (per-user) ---"
-          powershell.exe -NoProfile -Command "Try { Get-ChildItem -Path 'C:\$Recycle.Bin' -Force -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum | Select-Object @{N='SizeGB';E={[math]::Round((\$_.Sum/1GB),2)}} } Catch { Write-Output 'Recycle bin query failed' }"
-          echo
-
-          echo "-- Disk usage from Windows perspective (Get-Volume) ---"
-          powershell.exe -NoProfile -Command "Get-Volume | Select DriveLetter, FileSystemLabel, @{N='SizeGB';E={[math]::Round($_.Size/1GB,2)}}, @{N='FreeGB';E={[math]::Round($_.SizeRemaining/1GB,2)}}, @{N='PercentFree';E={if (\$_.Size -gt 0) {[math]::Round((\$_.SizeRemaining/\$_.Size*100),1)} else {'N/A'}}}" \
-            || true
-          echo
-
-          echo "--- Note: Sysinternals 'handle.exe' can reveal deleted-but-open files; not present by default on runners ---"
-          echo "If you still can't explain the used space, download and run handle.exe as Admin and run: handle.exe -u C:"
-          echo
-
-          echo "=== END ==="

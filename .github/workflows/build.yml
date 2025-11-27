@@ -46,6 +46,8 @@ jobs:
       #    swap-size-mb: 1024
       #    remove-dotnet: 'true'
 
+      - uses: Silverlan/common_actions/analyze_disk_space@main
+
       - name: Checkout
         uses: actions/checkout@v4
 

@@ -25,7 +25,7 @@ jobs:
             generators: "Visual Studio 17 2022"
             build_dir: 'build'
     steps:
-      - name: Windows disk diagnostics — multi-depth (pwsh, tolerant)
+      - name: Windows disk diagnostics — multi-depth (pwsh, tolerant, fixed)
         shell: pwsh
         run: |
           # tolerant diagnostics: aggregate sizes by multiple depths in one pass
@@ -103,11 +103,11 @@ jobs:
           Write-Output "`n--- Aggregated top directories by depth ---`n"
 
           for ($d = 1; $d -le $MaxDepth; $d++) {
-            Write-Output ">>> Top $TopN directories at depth $d (aggregated size of files beneath each):"
+            Write-Output ">>> Top $TopN directories at depth ${d} (aggregated size of files beneath each):"
             try {
               $pairs = $agg[$d].GetEnumerator() | Sort-Object Value -Descending | Select-Object -First $TopN
               if ($pairs.Count -eq 0) {
-                Write-Output "  (no entries found at depth $d — maybe permission errors or empty)"
+                Write-Output "  (no entries found at depth ${d} — maybe permission errors or empty)"
               } else {
                 $pairs | ForEach-Object {
                   [PSCustomObject]@{
@@ -118,7 +118,7 @@ jobs:
                 } | Format-Table SizeGB, SizeMB, Path -AutoSize
               }
             } catch {
-              Write-Warning "Aggregation/printing failed for depth $d: $($_.Exception.Message)"
+              Write-Warning "Aggregation/printing failed for depth ${d}: $($_.Exception.Message)"
             }
             Write-Output ""
           }
